@@ -1,46 +1,3 @@
-<div align="center">
-
-# T2I-Copilot: A Training-Free Multi-Agent Text-to-Image System for Enhanced Prompt Interpretation and Interactive Generation (ICCV'25)
-
-[Chieh-Yun Chen](https://chiehyunchen.github.io/), Min Shi, Gong Zhang, [Humphrey Shi](https://www.humphreyshi.com/home)
-
-
-</div>
-
-![Header Image Placeholder](assets/fig-Teaser-Mustang.jpg)
-
-[![arXiv](https://img.shields.io/badge/arXiv-2507.20536-red)](https://arxiv.org/pdf/2507.20536) [![MIT license](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/SHI-Labs/T2I-Copilot/blob/master/LICENSE)
-
-## TL;DR
-🚀 First T2I system to enable both pre- and post-generation user control
-
-🤖 Propose a training-free multi-agent framework where 3 expert agents collaborate to boost interpretability & efficiency
-
-🔍 Bridges human intent with AI creativity for truly interactive & controllable generation
-
-💥 Matches top-tier models, Recraft V3, Imagen 3, and outperforms FLUX1.1-pro by +6.17% at just 16.6% of the cost
-
-🥇 Beats FLUX.1-dev (+9.11%) and SD 3.5 Large (+6.36%) on GenAI-Bench with VQAScore
-
-## 📰 News
-- Jun. 26, 2025 | 🎉🎉🎉 T2I-Copilot is accepted by ICCV 2025.
-
-
-<div align="center">
-  <video src="place_holder" width="70%"> </video>
-</div>
-
-## 📑 Open-source Plan
-
- - [x] Inference codes
- - [x] Technical Report
- - [ ] Interactive Demo
-
-## 🎨 Qualitative Performance
-![Header Image Placeholder](assets/fig-qualitative_result.jpg)
-
-## 📊 Quantitative Performance
-![Header Image Placeholder](assets/fig-quantitative_result.png)
 
 ## 🚀 Quick Start
 
@@ -154,27 +111,3 @@ results/
 │   └── AgentSys_vRelease_human_in_loop/
 └── DrawBench/
 ```
-
-## 🙏 Acknowledgements
-
-We gratefully acknowledge the generous contributions of the open-source community, especially the teams behind **[FLUX.1-dev](https://huggingface.co/black-forest-labs/FLUX.1-dev)**, **[PowerPaint](https://github.com/open-mmlab/PowerPaint)**, **[GroundingSAM2](https://github.com/IDEA-Research/Grounded-SAM-2)**, **[Mistral AI](https://huggingface.co/mistralai/Mistral-Small-3.1-24B-Instruct-2503)**, **[QWen2.5-VL](https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct)**, and **[vllm](https://docs.vllm.ai/en/latest/models/supported_models.html)**. Their publicly available code and models made this work possible.
-
-
-## 📖 Citation
-
-```bibtex
-@inproceedings{t2i_copilot_2025,
-  title={T2I-Copilot: A Training-Free Multi-Agent Text-to-Image System for Enhanced Prompt Interpretation and Interactive Generation},
-  author={Chieh-Yun Chen and Min Shi and Gong Zhang and Humphrey Shi},
-  booktitle={Proceedings of the IEEE/CVF International Conference on Computer Vision (ICCV)},
-  year={2025}
-}
-```
-
----
-
-<div align="center">
-
-**Made with ❤️ for the AI community**
-
-</div> 
