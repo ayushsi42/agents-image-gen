@@ -513,16 +513,16 @@ def load_models():
             qwen_image_pipe = QwenImagePipeline.from_pretrained(
                 "Qwen/Qwen-Image", 
                 torch_dtype=torch.float16,  # More widely supported than bfloat16
-                device_map="auto"
-            ).to("cuda")
+                device_map="cuda"
+            )
 
         print("Loading Qwen Image Edit model...")
         with torch.cuda.device(0):  # Keep on same GPU for better memory management
             qwen_edit_pipe = QwenImageEditPipeline.from_pretrained(
                 "Qwen/Qwen-Image-Edit", 
                 torch_dtype=torch.float16,
-                device_map="auto"
-            ).to("cuda")
+                device_map={"": "cuda:1"}
+            )
 
         # Enable model memory efficiency
         if hasattr(qwen_image_pipe, "enable_model_cpu_offload"):
