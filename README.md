@@ -1,5 +1,5 @@
 
-## 🚀 Quick Start
+## Quick Start
 
 ### Install & Run
 ```bash
@@ -10,20 +10,14 @@ conda activate t2i_copilot
 # 2. Put the OpenAI Key into .env
 OPENAI_API_KEY=<YOUR_KEY_HERE>
 
-# 3-1. Download checkpoint from PowerPaint (https://github.com/open-mmlab/PowerPaint): Image inpainting & editing
-git lfs clone https://huggingface.co/JunhaoZhuang/PowerPaint-v2-1/ models/PowerPaint/checkpoints/ppt-v2-1
-
-# 3-2. Download checkpoint from GroundingSAM2 (https://github.com/IDEA-Research/Grounded-SAM-2): Mask generation for editing
-cd models/Grounded_SAM2/checkpoints/
-bash download_ckpts.sh
-cd models/Grounded_SAM2/gdino_checkpoints/
-bash download_ckpts.sh
+# 3. Install required packages
+pip install diffusers
 
 # 4. Run with default settings (GPT-4o-mini, automatic mode)
 python main.py --benchmark_name cool_sample.txt
 ```
 
-## 🎯 System Modes
+## System Modes
 
 | Mode | Description | Command |
 |------|-------------|---------|
@@ -33,7 +27,7 @@ python main.py --benchmark_name cool_sample.txt
 
 ## 🔧 Open Source MLLM Setup
 
-⚠️ **Use separate conda environment to avoid conflicts**
+**Use separate conda environment to avoid conflicts**
 
 ```bash
 # Terminal 1: Start vLLM server
@@ -53,10 +47,10 @@ conda activate t2i_copilot
 python main.py --use_open_llm
 ```
 
-## 📋 Usage Examples
+## Usage Examples
 
 ### Basic Usage
-*Default using 2 L40S GPUs to load FLUX.1-dev and PowerPaint with its own GPU, correspondingly*
+*Default using GPU to load Qwen-Image and Qwen-Image-Edit models*
 ```bash
 # GPT-4o-mini + Automatic mode
 python main.py --benchmark_name GenAIBenchmark/genai_image_seed.json
@@ -87,7 +81,7 @@ python main.py --use_open_llm \
 | `--open_llm_model` | Open LLM model name | `mistralai/Mistral-Small-3.1-24B-Instruct-2503` |
 | `--open_llm_port` | vLLM server port | `8000` |
 
-## 🔍 Troubleshooting
+## Troubleshooting
 
 
 - **PyTorch Error**: `RuntimeError: operator torchvision::nms does not exist`
@@ -98,16 +92,3 @@ python main.py --use_open_llm \
 - **vLLM Conflicts**: Use separate conda environments
     - vLLM server: `transformers>=4.51.1,<4.53.0`
     - Main.py: Different transformers version
-
-## 📁 Output Structure
-
-```
-results/
-├── GenAIBenchmark-fixseed/
-│   ├── AgentSys_vRelease/
-│   │   ├── 000_FLUX.1-dev.png
-│   │   ├── 000_config.json
-│   │   └── 000.log
-│   └── AgentSys_vRelease_human_in_loop/
-└── DrawBench/
-```

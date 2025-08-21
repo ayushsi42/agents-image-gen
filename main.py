@@ -1,6 +1,10 @@
 import os
-from typing import Literal, List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Union, Literal
 from enum import Enum
+
+# Node names
+NODE_MODEL_SELECTION = "model_selection"
+NODE_EVALUATION = "evaluation"
 from datetime import datetime
 
 from langchain_core.tools import tool
@@ -27,10 +31,7 @@ import torch
 from PIL import Image
 import sys
 
-from diffusers import FluxPipeline 
-from models.Grounded_SAM2.test_REF import referring_expression_segmentation
-from models.mask_draw_client import request_mask
-from models.PowerPaint.test import PowerPaintController, generate_mask_from_bbox, dilate_mask, parse_bbox
+from diffusers import QwenImagePipeline, QwenImageEditPipeline
 
 import re
 import json
@@ -40,12 +41,10 @@ import time
 from tqdm import tqdm
 
 # Initialize model variables
-flux_pipe = None
-# flux_pipe_editing = None
-powerpaint_controller = None
+qwen_image_pipe = None
+qwen_edit_pipe = None
 
 class CreativityLevel(Enum):
-    LOW = "low"      # Ask users for most details
     MEDIUM = "medium"  # Fill some details, ask for important ones
     HIGH = "high"    # Autonomously fill in most details
 
@@ -82,19 +81,12 @@ class T2IConfig:
                 "selected_model": "",
                 "generating_prompt": "",
                 "reference_content_image": "",
-                "editing_target": "",
-                "reference_mask_dir": "",
                 "reasoning": "",
                 "confidence_score": 0.0,
                 "gen_image_path": "",
                 "evaluation_score": 0.0,
                 "user_feedback": None,
-                "improvement_suggestions": None,
-                "editing_mask": None, # given by the user when evaluation
-                "unwanted_object": None,
-                "task_type": None,
-                "bbox_coordinates": None,
-                "powerpaint_guidance_scale": 0.0  # Default guidance scale for PowerPaint
+                "improvement_suggestions": None
             }
         }
 
@@ -110,19 +102,12 @@ class T2IConfig:
             "selected_model": "",
             "generating_prompt": "",
             "reference_content_image": prev_gen_image_path,
-            "editing_target": "",
-            "reference_mask_dir": "",
             "reasoning": "",
             "confidence_score": 0.0,
             "gen_image_path": "",
             "evaluation_score": 0.0,
             "user_feedback": None,
-            "improvement_suggestions": None,
-            "editing_mask": None, # given by the user when evaluation
-            "unwanted_object": None,
-            "task_type": None,
-            "bbox_coordinates": None,
-            "powerpaint_guidance_scale": 0.0  # Default guidance scale for PowerPaint
+            "improvement_suggestions": None
         }
         self.regeneration_count = index
         return f"count_{index}"
@@ -140,10 +125,6 @@ class T2IConfig:
         # Convert the CreativityLevel enum to its string value
         prompt_understanding = self.prompt_understanding.copy()
         prompt_understanding["creativity_level"] = prompt_understanding["creativity_level"].value
-
-        # Log the type and content of prompt_analysis before processing
-        # self.logger.debug(f"prompt_analysis type: {type(prompt_understanding['prompt_analysis'])}")
-        # self.logger.debug(f"prompt_analysis content: {prompt_understanding['prompt_analysis']}")
 
         # Ensure prompt_analysis is stored as a dictionary, not a JSON string
         if isinstance(prompt_understanding["prompt_analysis"], str):
@@ -519,52 +500,83 @@ class IntentionAnalyzer:
             raise
 
 def load_models():
-    """Pre-load models"""
-    global flux_pipe, powerpaint_controller
+    """Pre-load models with proper GPU memory management"""
+    global qwen_image_pipe, qwen_edit_pipe
 
-    print("Loading Flux default model...")
-    with torch.cuda.device(1):
-        flux_pipe = FluxPipeline.from_pretrained("black-forest-labs/FLUX.1-dev", torch_dtype=torch.bfloat16).to("cuda")
+    # Clear any existing GPU memory
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
-    print("Loading PowerPaint model...")
-    with torch.cuda.device(0):
-        # Initialize the PowerPaint controller
-        powerpaint_dir = "./models/PowerPaint"
-        checkpoint_dir = os.path.join(powerpaint_dir, "checkpoints/ppt-v2-1")
-        weight_dtype = torch.float16
-        powerpaint_controller = PowerPaintController(weight_dtype, checkpoint_dir, False, "ppt-v2-1")
+    try:
+        print("Loading Qwen Image model...")
+        with torch.cuda.device(0):  # Primary GPU
+            qwen_image_pipe = QwenImagePipeline.from_pretrained(
+                "Qwen/Qwen-Image", 
+                torch_dtype=torch.float16,  # More widely supported than bfloat16
+                device_map="auto"
+            ).to("cuda")
+
+        print("Loading Qwen Image Edit model...")
+        with torch.cuda.device(0):  # Keep on same GPU for better memory management
+            qwen_edit_pipe = QwenImageEditPipeline.from_pretrained(
+                "Qwen/Qwen-Image-Edit", 
+                torch_dtype=torch.float16,
+                device_map="auto"
+            ).to("cuda")
+
+        # Enable model memory efficiency
+        if hasattr(qwen_image_pipe, "enable_model_cpu_offload"):
+            qwen_image_pipe.enable_model_cpu_offload()
+        if hasattr(qwen_edit_pipe, "enable_model_cpu_offload"):
+            qwen_edit_pipe.enable_model_cpu_offload()
+
+    except RuntimeError as e:
+        if "out of memory" in str(e):
+            print("GPU out of memory. Trying to free up memory...")
+            torch.cuda.empty_cache()
+            raise RuntimeError("GPU out of memory. Try reducing batch size or image dimensions.")
+        raise
     
 
-@tool("Flux.1-dev")
-def generate_with_flux(prompt: str, seed: int) -> str:
+@tool("Qwen-Image")
+def generate_with_qwen_image(prompt: str, seed: int) -> str:
     """
-    Given a prompt, Flux.1-dev generates general purpose images with high quality and consistency.
+    Given a prompt, Qwen-Image generates general purpose images with high quality and consistency.
     
     Args:
         prompt: The text prompt describing the image to generate
+        seed: Random seed for reproducibility
         
     Returns:
         Path to generated images
     """
-    logger.info(f"Executing Flux with prompt: {prompt}; seed {seed}")
-    logger.info("Loading Flux default model...")
+    logger.info(f"Executing Qwen-Image with prompt: {prompt}; seed {seed}")
+    logger.info("Using Qwen-Image model...")
 
     try:
-        image = flux_pipe(
-            prompt,
-            height=1024,
-            width=1024,
-            guidance_scale=3.5,
-            num_inference_steps=28,
-            max_sequence_length=512,
-            generator=torch.Generator("cpu").manual_seed(seed)
-        ).images[0]
+        # Clear CUDA cache before generation
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        # Ensure we're on the right device
+        generator = torch.Generator("cuda").manual_seed(seed)
+        
+        with torch.inference_mode():
+            image = qwen_image_pipe(
+                prompt,
+                height=1024,
+                width=1024,
+                guidance_scale=3.5,
+                num_inference_steps=28,
+                max_sequence_length=512,
+                generator=generator
+            ).images[0]
 
         # Set output path based on regeneration count
         if config.regeneration_count > 0:
-            output_path = os.path.join(config.save_dir, f"{config.image_index}_regen{config.regeneration_count}_FLUX.1-dev.png")
+            output_path = os.path.join(config.save_dir, f"{config.image_index}_regen{config.regeneration_count}_Qwen-Image.png")
         else:
-            output_path = os.path.join(config.save_dir, f"{config.image_index}_FLUX.1-dev.png")
+            output_path = os.path.join(config.save_dir, f"{config.image_index}_Qwen-Image.png")
         image.save(output_path)
         
 
@@ -576,193 +588,67 @@ def generate_with_flux(prompt: str, seed: int) -> str:
         return f"Error generating image with Flux: {str(e)}"
 
 
-@tool("PowerPaint")
-def generate_with_powerpaint(prompt: str, existing_image_dir: str, mask_image_dir: str = None, task: str = "text-guided", seed: int = 42, guidance_scale: float = 7.5) -> str:
+@tool("Qwen-Image-Edit")
+def generate_with_qwen_edit(prompt: str, existing_image_dir: str, seed: int = 42, guidance_scale: float = 7.5) -> str:
     """
-    PowerPaint: High-Quality Versatile Image Inpainting. Can perform text-guided inpainting (adding and object or replacing an existing object) or object removal.
+    Qwen-Image-Edit: High-Quality Image Editing. Directly edit images using text instructions.
     
     Args:
-        prompt: The text prompt describing the desired modifications or object to remove
+        prompt: The text prompt describing the desired modifications
         existing_image_dir: The path to the existing image to edit
-        mask_image_dir: Path to mask image defining regions to edit
-        task: The inpainting task type, either "text-guided" or "object-removal"
         seed: Random seed for reproducibility
-        guidance_scale: The guidance scale for the PowerPaint model (higher values increase prompt adherence)
+        guidance_scale: The guidance scale for the Qwen-Image-Edit model (higher values increase prompt adherence)
 
     Returns:
         Path to generated image
     """
-    global powerpaint_controller
+    global qwen_edit_pipe
     
-    logger.info(f"Executing PowerPaint with prompt: {prompt}; task: {task}; seed: {seed}")
-    if mask_image_dir:
-        logger.info(f"Mask image directory: {mask_image_dir}")
+    logger.info(f"Executing Qwen Image Edit with prompt: {prompt}; seed: {seed}")
     
     # Set up output path
     if config.regeneration_count > 0:
-        output_path = os.path.join(config.save_dir, f"{config.image_index}_regen{config.regeneration_count}_PowerPaint.png")
+        output_path = os.path.join(config.save_dir, f"{config.image_index}_regen{config.regeneration_count}_Qwen-Image-Edit.png")
     else:
-        output_path = os.path.join(config.save_dir, f"{config.image_index}_PowerPaint.png")
+        output_path = os.path.join(config.save_dir, f"{config.image_index}_Qwen-Image-Edit.png")
     
     try:
-        input_img = Image.open(existing_image_dir).convert("RGB")
-        mask_img = Image.open(mask_image_dir).convert("RGB")
-        input_image = {"image": input_img, "mask": mask_img}
-
-        if task == "text-guided":
-
-            result = powerpaint_controller.predict(
-                    input_image,
-                    prompt,
-                    fitting_degree=1.0,
-                    ddim_steps=45,
-                    scale=guidance_scale,
-                    seed=seed,
-                    negative_prompt="",
-                    task=task,
-                )
-        elif task == "object-removal":
-            result = powerpaint_controller.predict(
-                    input_image,
-                    prompt="",
-                    fitting_degree=1.0,
-                    ddim_steps=45,
-                    scale=guidance_scale,
-                    seed=seed,
-                    negative_prompt="",
-                    task=task,
-                )
+        # Clear CUDA cache before generation
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
+        # Load and verify input image
+        try:
+            input_img = Image.open(existing_image_dir).convert("RGB")
+            if input_img.size[0] > 2048 or input_img.size[1] > 2048:
+                logger.warning("Large image detected. Resizing to max 2048x2048 to prevent OOM.")
+                input_img.thumbnail((2048, 2048), Image.Resampling.LANCZOS)
+        except Exception as e:
+            logger.error(f"Error loading input image: {str(e)}")
+            raise ValueError(f"Failed to load input image from {existing_image_dir}: {str(e)}")
+        
+        # Ensure we're on the right device
+        generator = torch.Generator("cuda").manual_seed(seed)
+        
+        with torch.inference_mode():
+            result = qwen_edit_pipe(
+                prompt=prompt,
+                image=input_img,
+                guidance_scale=guidance_scale,
+                num_inference_steps=45,
+                generator=generator
+            ).images[0]
 
         # Save the result
         result.save(output_path)
         logger.debug(f"Successfully generated image at: {output_path}\n")
         return output_path
     except Exception as e:
-        logger.error(f"Error in PowerPaint generation: {str(e)}; return input image path: {existing_image_dir}")
+        logger.error(f"Error in Qwen Image Edit generation: {str(e)}; return input image path: {existing_image_dir}")
         return existing_image_dir
 
 
-def get_bbox_from_gpt(image_path: str, prompt: str, unwanted_object: str) -> str:
-    """
-    Use GPT to determine the bounding box coordinates for a referring object in an image.
-    
-    Args:
-        image_path: Path to the image
-        prompt: The text prompt describing what to add/modify
-        unwanted_object: The object to be removed (in "text-guided" task)
-        
-    Returns:
-        Bounding box coordinates as a string in format "[x1,y1,x2,y2]" or mask path
-    """
-    logger.info(f"Requesting bounding box coordinates from GPT for: {prompt}")
-    
-    # Read and encode the image
-    with open(image_path, "rb") as image_file:
-        base64_image = base64.b64encode(image_file.read()).decode("utf-8")
-    
-    # Prepare the system prompt based on task type
-    system_prompt = """You are an expert computer vision assistant that helps identify precise locations in images.
-    Your task is to 
-    1. If the prompt intents to add an object, determine the exact suitable bounding box coordinates where a new object should be placed in an image.
-    2. If the prompt intents to replace an object, determine the exact bounding box coordinates where an unwanted object should be removed in an image.
-    
-    The coordinates should be in the format [x1, y1, x2, y2] where:
-    - (x1, y1) is the top-left corner of the bounding box
-    - (x2, y2) is the bottom-right corner of the bounding box
-    - All values should be integers between 0 and 1024 (the image is 1024x1024 pixels)
-    - The coordinates should define a reasonable size for the object being added
-    
-    Analyze the image carefully and determine the most natural and appropriate location for the requested addition.
-    Return ONLY the coordinates in the format [x1, y1, x2, y2] without any additional text or explanation."""
-    
-    user_prompt = f"Evaluate the prompt intention {prompt}. Provide the exact bounding box coordinates where the object should be placed."
-    
-    # Create the message for GPT-4o-mini using the same format as other calls in the codebase
-    try:    
-        messages = [
-            (
-                "system",
-                system_prompt
-            ),
-            (
-                "human",
-                [
-                    {
-                        "type": "text", 
-                        "text": user_prompt
-                    },
-                    {
-                        "type": "image_url", 
-                        "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}
-                    }
-                ]
-            )
-        ]
-        
-        # Use the existing llm instance that's already initialized with GPT-4o-mini
-        response = llm.invoke(messages)
-        
-        # Extract the response content
-        bbox_text = response.content.strip()
-        logger.debug(f"GPT response for bbox: {bbox_text}")
-        
-        # Clean up the response to ensure it's in the correct format
-        # Remove any non-coordinate text that might be in the response
-        import re
-        bbox_match = re.search(r'\[\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\]', bbox_text)
-        
-        if bbox_match:
-            x1, y1, x2, y2 = map(int, bbox_match.groups())
-            # Ensure coordinates are within bounds and properly ordered
-            x1, x2 = min(max(0, x1), 1024), min(max(0, x2), 1024)
-            y1, y2 = min(max(0, y1), 1024), min(max(0, y2), 1024)
-            
-            # Ensure x1 < x2 and y1 < y2
-            if x1 > x2:
-                x1, x2 = x2, x1
-            if y1 > y2:
-                y1, y2 = y2, y1
-                
-            bbox_coords = f"[{x1}, {y1}, {x2}, {y2}]"
-            logger.info(f"Generated bounding box coordinates: {bbox_coords}")
-            return bbox_coords, "bbox"
-        else:
-            logger.warning(f"Could not extract valid bounding box from GPT response: {bbox_text}")
-            # call test_REF.py to get mask
-            if unwanted_object:
-                sam_mask_path = referring_expression_segmentation(
-                                    image_path=image_path,
-                                    text_input=unwanted_object,
-                                    output_dir=config.save_dir
-                                )
-            else:
-                sam_mask_path = referring_expression_segmentation(
-                                    image_path=image_path,
-                                    text_input=prompt,
-                                    output_dir=config.save_dir
-                                )
-            
-            # Return a default bounding box in the center of the image
-            return sam_mask_path, "mask"
-            
-    except Exception as e:
-        logger.error(f"Error getting bounding box from GPT: {str(e)}")
-        # call test_REF.py to get mask
-        if unwanted_object:
-            sam_mask_path = referring_expression_segmentation(
-                                image_path=image_path,
-                                text_input=unwanted_object,
-                                output_dir=config.save_dir
-                            )
-        else:
-            sam_mask_path = referring_expression_segmentation(
-                                image_path=image_path,
-                                text_input=prompt,
-                                output_dir=config.save_dir
-                            )
-        
-        # Return a default bounding box in the center of the image
-        return sam_mask_path, "mask"
+
 
 class ModelSelector:
     """Helper class for model selection and execution"""
@@ -771,12 +657,12 @@ class ModelSelector:
         self.llm_json = llm.bind(response_format={"type": "json_object"})
         self.logger = logger
         self.tools = {
-            "Flux.1-dev": generate_with_flux,
-            "PowerPaint": generate_with_powerpaint,
+            "Qwen-Image": generate_with_qwen_image,
+            "Qwen-Image-Edit": generate_with_qwen_edit,
         }
         self.available_models = {
-            "Flux.1-dev": generate_with_flux.func.__doc__,
-            "PowerPaint": generate_with_powerpaint.func.__doc__,
+            "Qwen-Image": generate_with_qwen_image.func.__doc__,
+            "Qwen-Image-Edit": generate_with_qwen_edit.func.__doc__,
         }
 
     def _create_system_prompt(self) -> str:
@@ -785,14 +671,14 @@ class ModelSelector:
             return f"""Select the most suitable model for the given task.
             
             Available models:
-            1. Flux.1-dev: {self.available_models['Flux.1-dev']}
-            2. PowerPaint: {self.available_models['PowerPaint']}
+            1. Qwen-Image: {self.available_models['Qwen-Image']}
+            2. Qwen-Image-Edit: {self.available_models['Qwen-Image-Edit']}
 
             Note:
-            - Best cases for selecting Flux.1-dev:
-                - If the prompt is general, the Flux.1-dev model should be selected.
+            - Best cases for selecting Qwen-Image:
+                - If the prompt is general, the Qwen-Image model should be selected.
 
-                - For atmosphere/mood/lighting/style improvements or enhancing visual qualities, select Flux.1-dev and create a generating_prompt that:
+                - For atmosphere/mood/lighting/style improvements or enhancing visual qualities, select Qwen-Image and create a generating_prompt that:
                 * Integrates specific atmospheric details into the original prompt
                 * Uses descriptive language for the desired mood or visual effect
                 * Examples:
@@ -806,8 +692,8 @@ class ModelSelector:
                 
                 - For rearrangement improvements (e.g., repositioning elements), select Flux.1-dev and create a generating_prompt that combines the original prompt with the improvement suggestions to ensure proper placement
                     
-            - Best cases for selecting PowerPaint:
-                - For high-quality inpainting and object removal, select PowerPaint. Best use cases include:
+            - Best cases for selecting Qwen-Image-Edit:
+                - For high-quality inpainting and object removal, select Qwen-Image-Edit. Best use cases include:
                     * Precise object removal with natural background filling (e.g., "remove the person from the image", "erase the car")
                     * Adding completely new objects to specific regions (e.g., "add a realistic cat to the sofa", "place a vase of flowers on the table")
                     * When adding an object, provide the exact bounding box coordinates of the referring object to be added in the format of "[x1,y1,x2,y2]" while the coordinates for the referred removing object can be None (The given image resolution is 1024x1024)
@@ -838,9 +724,6 @@ class ModelSelector:
                 "selected_model": "model_name",
                 "reference_content_image": "path to the reference content image",
                 "generating_prompt": "model-specific prompt",
-                "unwanted_object": "the object to be removed",
-                "task_type": "text-guided" or "object-removal" for PowerPaint,
-                "bbox_coordinates": "bounding box coordinates of the object to be edited in the format of '[x1,y1,x2,y2]'",
                 "reasoning": "Detailed explanation of why this model was chosen",
                 "confidence_score": float  # 0.0 to 1.0
             }}
@@ -1101,7 +984,7 @@ class ModelSelector:
                 "confidence_score": 0.5
             }
 
-def intention_understanding_node(state: MessagesState) -> Command[Literal["model_selection"]]:
+def intention_understanding_node(state: MessagesState) -> Command[str]:
     """Process user's initial prompt and handle interactions."""
 
     analyzer = IntentionAnalyzer(llm)
@@ -1241,7 +1124,7 @@ def intention_understanding_node(state: MessagesState) -> Command[Literal["model
         logger.debug(f"Command: {command}")
         return command
 
-def model_selection_node(state: MessagesState) -> Command[Literal["evaluation", "model_selection"]]:
+def model_selection_node(state: MessagesState) -> Command[str]:
     """Process model selection and image generation."""
     selector = ModelSelector(llm)
     
@@ -1274,175 +1157,7 @@ def model_selection_node(state: MessagesState) -> Command[Literal["evaluation", 
         current_config["reasoning"] = model_selection["reasoning"]
         current_config["confidence_score"] = model_selection["confidence_score"]
 
-        # Initialize mask_image_path to None
-        mask_image_path = None
 
-        # NOTE: if model selection is editing, ask user for given the mask or call open-vocabulary model for mask generation
-        if model_selection['selected_model'] == "PowerPaint":
-            logger.info(f"Selected model is PowerPaint, determining mask generation approach")
-            
-            # Handle mask based on task type and human-in-the-loop mode
-            if config.regeneration_count == 0:
-                if config.is_human_in_loop:
-                    logger.info(f"Human-in-the-loop mode enabled. Requesting mask for {current_config["reference_content_image"]}...")
-                    mask_image_path = request_mask(current_config["reference_content_image"])
-                else:
-                    # For automated mask generation based on task type
-                    if current_config["task_type"] == "text-guided":
-                        if current_config["unwanted_object"] is not None:
-                            logger.info("Generating unwanted object mask by RES for text-guided inpainting")
-                            try:
-                                # Call the referring_expression_segmentation function
-                                sam_mask_path = referring_expression_segmentation(
-                                    image_path=current_config["reference_content_image"],
-                                    text_input=current_config["unwanted_object"],
-                                    output_dir=config.save_dir
-                                )
-                                # expand the mask to make the mask boundary unavailiable
-                                print(f"Expanding mask: {sam_mask_path}")
-                                sam_mask_path = dilate_mask(sam_mask_path)
-                                if sam_mask_path and os.path.exists(sam_mask_path):
-                                    current_config["reference_mask_dir"] = sam_mask_path
-                                    print(f"Using SAM-generated mask: {current_config["reference_mask_dir"]}")
-                                else:
-                                    print("Failed to generate mask with SAM.")
-                            except Exception as e:
-                                print(f"Error generating mask with SAM: {e}")
-                        elif current_config["bbox_coordinates"] is not None:
-                            logger.info(f"Generating mask for text-guided inpainting: '{current_config["generating_prompt"]}'")
-                            gpt_mask_path = generate_mask_from_bbox(parse_bbox(current_config["bbox_coordinates"]), current_config["reference_content_image"])
-                            if gpt_mask_path:
-                                current_config["reference_mask_dir"] = gpt_mask_path
-                                logger.info(f"Using bbox-generated mask: {current_config["reference_mask_dir"]}")
-                            else:
-                                logger.info("Failed to generate mask from bbox.")
-                        
-                        elif current_config["bbox_coordinates"] is None or current_config["reference_mask_dir"] is None:
-                            # an exception for bbox is None, given the image and the prompt for gpt to again provide the bbox for the referrring object's coordinates
-                            
-                            logger.info(f"Generating bounding box coordinates for text-guided inpainting: '{current_config['generating_prompt']}'")
-        
-                            # Call GPT to provide the bbox for the referring object's coordinates
-                            bbox_coords_or_mask_path, using_task_type = get_bbox_from_gpt(
-                                image_path=current_config["reference_content_image"],
-                                prompt=current_config["generating_prompt"],
-                                unwanted_object=current_config["unwanted_object"]
-                            )
-                            
-                            if using_task_type == "bbox":
-                                # Update the bbox_coordinates in the current config
-                                current_config["bbox_coordinates"] = bbox_coords_or_mask_path
-                                logger.info(f"Using GPT-generated bbox coordinates: {bbox_coords_or_mask_path}")
-                                # Generate mask from the bbox coordinates
-                                mask_image_path = generate_mask_from_bbox(parse_bbox(current_config["bbox_coordinates"]), current_config["reference_content_image"])
-                            elif using_task_type == "mask":
-                                mask_image_path = bbox_coords_or_mask_path
-                                logger.info(f"Using RES-generated mask: {mask_image_path}")
-
-                            mask_image_path = dilate_mask(mask_image_path)
-                            current_config["reference_mask_dir"] = mask_image_path
-                            
-                    elif current_config["task_type"] == "object-removal" and referring_expression_segmentation is not None:
-                        logger.info(f"Generating mask for object removal inpainting: '{current_config["unwanted_object"]}'")
-                        try:
-                            # Call the referring_expression_segmentation function
-                            sam_mask_path = referring_expression_segmentation(
-                                image_path=current_config["reference_content_image"],
-                                text_input=current_config["unwanted_object"],
-                                output_dir=config.save_dir
-                            )
-                            # expand the mask to make the mask boundary unavailiable
-                            print(f"Expanding mask: {sam_mask_path}")
-                            sam_mask_path = dilate_mask(sam_mask_path)
-                            if sam_mask_path and os.path.exists(sam_mask_path):
-                                current_config["reference_mask_dir"] = sam_mask_path
-                                print(f"Using SAM-generated mask: {current_config["reference_mask_dir"]}")
-                            else:
-                                print("Failed to generate mask with SAM.")
-                        except Exception as e:
-                            print(f"Error generating mask with SAM: {e}")
-
-            elif prev_regen_config["editing_mask"] is None:
-                if config.is_human_in_loop:
-                    logger.info(f"Human-in-the-loop mode enabled. Requesting mask for {current_config["reference_content_image"]}...")
-                    current_config["reference_mask_dir"] = request_mask(current_config["reference_content_image"])
-                else:
-                    # For automated mask generation based on task type
-                    if current_config["task_type"] == "text-guided":
-                        if current_config["unwanted_object"] is not None:
-                            logger.info("Generating unwanted object mask by RES for text-guided inpainting")
-                            try:
-                                # Call the referring_expression_segmentation function
-                                sam_mask_path = referring_expression_segmentation(
-                                    image_path=current_config["reference_content_image"],
-                                    text_input=current_config["unwanted_object"],
-                                    output_dir=config.save_dir
-                                )
-                                # expand the mask to make the mask boundary unavailiable
-                                print(f"Expanding mask: {sam_mask_path}")
-                                sam_mask_path = dilate_mask(sam_mask_path)
-                                if sam_mask_path and os.path.exists(sam_mask_path):
-                                    current_config["reference_mask_dir"] = sam_mask_path
-                                    print(f"Using SAM-generated mask: {current_config["reference_mask_dir"]}")
-                                else:
-                                    print("Failed to generate mask with SAM.")
-                            except Exception as e:
-                                print(f"Error generating mask with SAM: {e}")
-                        elif current_config["bbox_coordinates"] is not None:
-                            logger.info(f"Generating mask for text-guided inpainting: '{current_config["generating_prompt"]}'")
-                            gpt_mask_path = generate_mask_from_bbox(parse_bbox(current_config["bbox_coordinates"]), current_config["reference_content_image"])
-                            if gpt_mask_path:
-                                current_config["reference_mask_dir"] = gpt_mask_path
-                                logger.info(f"Using bbox-generated mask: {current_config["reference_mask_dir"]}")
-                            else:
-                                logger.info("Failed to generate mask from bbox.")
-                        
-                        elif current_config["bbox_coordinates"] is None or current_config["reference_mask_dir"] is None:
-                            # an exception for bbox is None, given the image and the prompt for gpt to again provide the bbox for the referrring object's coordinates
-                            
-                            logger.info(f"Generating bounding box coordinates for text-guided inpainting: '{current_config['generating_prompt']}'")
-        
-                            # Call GPT to provide the bbox for the referring object's coordinates
-                            bbox_coords_or_mask_path, using_task_type = get_bbox_from_gpt(
-                                image_path=current_config["reference_content_image"],
-                                prompt=current_config["generating_prompt"],
-                                unwanted_object=current_config["unwanted_object"]
-                            )
-                            
-                            if using_task_type == "bbox":
-                                # Update the bbox_coordinates in the current config
-                                current_config["bbox_coordinates"] = bbox_coords_or_mask_path
-                                logger.info(f"Using GPT-generated bbox coordinates: {bbox_coords_or_mask_path}")
-                                # Generate mask from the bbox coordinates
-                                mask_image_path = generate_mask_from_bbox(parse_bbox(current_config["bbox_coordinates"]), current_config["reference_content_image"])
-                            elif using_task_type == "mask":
-                                mask_image_path = bbox_coords_or_mask_path
-                                logger.info(f"Using RES-generated mask: {mask_image_path}")
-
-                            mask_image_path = dilate_mask(mask_image_path)
-                            current_config["reference_mask_dir"] = mask_image_path
-
-                    elif current_config["task_type"] == "object-removal" and referring_expression_segmentation is not None:
-                        logger.info(f"Generating mask for object removal inpainting: '{current_config["unwanted_object"]}'")
-
-                        # Call the referring_expression_segmentation function
-                        sam_mask_path = referring_expression_segmentation(
-                            image_path=current_config["reference_content_image"],
-                            text_input=current_config["unwanted_object"],
-                            output_dir=config.save_dir
-                        )
-                        # expand the mask to make the mask boundary unavailiable
-                        print(f"Expanding mask: {sam_mask_path}")
-                        sam_mask_path = dilate_mask(sam_mask_path)
-                        if sam_mask_path and os.path.exists(sam_mask_path):
-                            current_config["reference_mask_dir"] = sam_mask_path
-                            print(f"Using SAM-generated mask: {current_config["reference_mask_dir"]}")
-                        else:
-                            print("Failed to generate mask with SAM.")
-
-            else:
-                # Use the mask from the previous regeneration (which user provided when evaluation)
-                current_config["reference_mask_dir"] = config.get_prev_config()["editing_mask"]
 
         # Execute the selected model
         gen_image_path = execute_model(
@@ -1487,9 +1202,9 @@ def model_selection_node(state: MessagesState) -> Command[Literal["evaluation", 
         # If not a regeneration, raise the error
         raise
 
-def execute_model(model_name: str, prompt: str, task_type: str, mask_dir: str, reference_content_image: str) -> str:
+def execute_model(model_name: str, prompt: str, reference_content_image: str = None) -> str:
     """Execute the selected model and return paths to generated images."""
-    global flux_pipe, powerpaint_controller
+    global qwen_image_pipe, qwen_edit_pipe
     global model_inference_times
     selector = ModelSelector(llm)
     if model_name not in selector.tools:
@@ -1504,40 +1219,29 @@ def execute_model(model_name: str, prompt: str, task_type: str, mask_dir: str, r
         seed = random.randint(0, 1000000)
 
     # Execute the selected model
-    if model_name == "Flux.1-dev":
+    if model_name == "Qwen-Image":
         t0 = time.time()
         result = selector.tools[model_name].invoke({"prompt": prompt, "seed": seed})
         t1 = time.time()
-        model_inference_times["Flux.1-dev"].append(t1 - t0)
+        model_inference_times["Qwen-Image"].append(t1 - t0)
         return result
-    elif model_name == "PowerPaint":
-        
-        # Set default guidance scale if not provided
-        if task_type == "object-removal":
-            guidance_scale = 10
-        else:
-            guidance_scale = 7.5
+    elif model_name == "Qwen-Image-Edit":
         t0 = time.time()
-        logger.info(f"exisiting_image_dir: {reference_content_image}")
-        logger.info(f"mask_image_dir: {mask_dir}")
-        logger.info(f"task_type: {task_type}")
-        logger.info(f"Using guidance scale: {guidance_scale}")
+        logger.info(f"existing_image_dir: {reference_content_image}")
             
         result = selector.tools[model_name].invoke({
                                                 "prompt": prompt,
                                                 "existing_image_dir": reference_content_image,
-                                                "mask_image_dir": mask_dir,
-                                                "task": task_type,
                                                 "seed": seed,
-                                                "guidance_scale": guidance_scale,
+                                                "guidance_scale": 7.5,
                                                 })
         t1 = time.time()
-        model_inference_times["PowerPaint"].append(t1 - t0)
+        model_inference_times["Qwen-Image-Edit"].append(t1 - t0)
         return result
     else:
         raise ValueError(f"Unknown model: {model_name}")
 
-def evaluation_node(state: MessagesState) -> Command[Literal["model_selection", END]]:
+def evaluation_node(state: MessagesState) -> Command[str]:
     """Evaluate generated images and handle regeneration if needed."""
     last_message = state["messages"][-1]
     
@@ -1598,7 +1302,7 @@ def evaluation_node(state: MessagesState) -> Command[Literal["model_selection", 
             print("Evaluation feedback:", current_config['improvement_suggestions'])
             # TODO: visualize the image for user to evalute
             
-            feedback_type = input("\nWould you like to provide feedback?\n0. I like the image and no need to regenerate\n1. Provide text suggestions\n2. Draw regions to edit with editing instructions\n3. Skip feedback but want regenerate the image\nEnter choice (0-3): ")
+            feedback_type = input("\nWould you like to provide feedback?\n0. I like the image and no need to regenerate\n1. Provide text suggestions\n2. Skip feedback but want regenerate the image\nEnter choice (0-2): ")
             if feedback_type == "0":
                 logger.info("User likes the image, no need to regenerate.")
                 final_message = (
@@ -1616,13 +1320,9 @@ def evaluation_node(state: MessagesState) -> Command[Literal["model_selection", 
                 current_config["user_feedback"] = user_suggestion
             
             elif feedback_type == "2":
-                logger.info(f"Human in the loop, asking user for the mask")
-                # NOTE: open a canvas locally for user to draw the mask (need to launch a local server for transmitting the image for canvas)
-                mask_dir = request_mask(current_config["gen_image_path"])
-                current_config["editing_mask"] = mask_dir
-                logger.info(f"Mask dir: {current_config['editing_mask']}")
-                
-                user_suggestion = input("Enter your suggestions: ")
+                logger.info("Drawing-based edits are not supported in this version.")
+                print("Drawing-based edits are not supported in this version. Please provide text feedback instead.")
+                user_suggestion = input("Enter your text suggestions: ")
                 current_config["user_feedback"] = user_suggestion
 
             elif feedback_type == "3":
@@ -1630,9 +1330,7 @@ def evaluation_node(state: MessagesState) -> Command[Literal["model_selection", 
                 current_config["user_feedback"] = "User skip feeback, but want regenerate the image"
             
             regen_key = config.add_regeneration_config()
-            prev_config = config.get_prev_config()
             current_config = config.get_current_config()
-            current_config["reference_mask_dir"] = prev_config["editing_mask"]
             
             return Command(
                 update={
@@ -1759,6 +1457,15 @@ def track_llm_call(llm_func, llm_type, *args, **kwargs):
 
 def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, open_llm_model="mistralai/Mistral-Small-3.1-24B-Instruct-2503", open_llm_host="0.0.0.0", open_llm_port="8000", calculate_latency=False):
     """Main CLI entry point."""
+    # Check CUDA availability
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is not available. This code requires a GPU to run.")
+    
+    # Print GPU info
+    gpu_name = torch.cuda.get_device_name(0)
+    gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
+    print(f"\nUsing GPU: {gpu_name}")
+    print(f"Available GPU memory: {gpu_memory:.2f} GB")
     # Declare globals
     global logger, config
     global llm_latencies, llm_token_counts
@@ -1836,7 +1543,7 @@ def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, o
         single_turn_times = []
         multi_turn_times = []
         end2end_times = []
-        model_inference_times = {"Flux.1-dev": [], "PowerPaint": []}
+        model_inference_times = {"Qwen-Image": [], "Qwen-Image-Edit": []}
         llm_latencies = {"intention_analysis": [], "refine_prompt": [], "model_selection": [], "evaluation": []}
         llm_token_counts = {"intention_analysis": [], "refine_prompt": [], "model_selection": [], "evaluation": []}
         single_turn_count = 0
@@ -1871,35 +1578,20 @@ def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, o
             config.open_llm_host = open_llm_host 
             config.open_llm_port = open_llm_port 
             
-            if "DrawBench" in str(benchmark_name):
-                text_prompt = key
-                if "seed" in str(benchmark_name):
-                    config.seed = seeds[idx + start_idx]
-                else:
-                    config.seed = torch.random.seed()
-                config.image_index = f"{(idx+start_idx):03d}"
-            elif "GenAIBenchmark" in str(benchmark_name):
+            # Handle different benchmark types consistently
+            if "GenAIBenchmark" in str(benchmark_name):
                 text_prompt = prompts[key]['prompt'] 
-                if "seed" in str(benchmark_name):
-                    config.seed = prompts[key]["random_seed"]
-                else:
-                    config.seed = torch.random.seed()
+                config.seed = prompts[key].get("random_seed") if "seed" in str(benchmark_name) else torch.initial_seed()
                 config.image_index = prompts[key]['id']
-            else:
+            else:  # DrawBench or other benchmarks
                 text_prompt = key
-                if "seed" in str(benchmark_name):
-                    config.seed = seeds[idx + start_idx]
-                else:
-                    config.seed = torch.random.seed()
+                config.seed = seeds[idx + start_idx] if "seed" in str(benchmark_name) else torch.initial_seed()
                 config.image_index = f"{(idx+start_idx):03d}"
                 print(f"Working on Benchmark name: {benchmark_name}")
 
             # Setup logging for this iteration
             logger = setup_logging(save_dir, filename=f"{config.image_index}.log", console_output=False)
             config.logger = logger
-
-            if idx >= 1: 
-                break
 
             # start timing
             torch.cuda.reset_peak_memory_stats(0)
@@ -2000,9 +1692,10 @@ def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, o
             else:
                 print("Multi-turn average turns: 0")
             if max_gpu_memories:
-                print(f"GPU max memory usage: {max(max_gpu_memories):.2f} GB / 48 GB (L40S)")
+                total_gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
+                print(f"GPU max memory usage: {max(max_gpu_memories):.2f} GB / {total_gpu_memory:.2f} GB")
             else:
-                print(f"GPU max memory usage: 0.00 GB / 48 GB (L40S)  (fail to log)")
+                print("GPU max memory usage: 0.00 GB (fail to log)")
 
 
 if __name__ == "__main__":
@@ -2019,4 +1712,3 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     main(args.benchmark_name, args.human_in_the_loop, args.model_version, args.use_open_llm, args.open_llm_model, args.open_llm_host, args.open_llm_port, args.calculate_latency)
-
