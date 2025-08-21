@@ -13,6 +13,9 @@ import base64
 from langchain_openai import ChatOpenAI
 from langgraph.graph import MessagesState, StateGraph, START, END
 from langgraph.types import Command
+from diffusers import PipelineQuantizationConfig
+from diffusers import BitsAndBytesConfig as DiffusersBitsAndBytesConfig
+from transformers import BitsAndBytesConfig as TransformersBitsAndBytesConfig
 
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="langsmith")
@@ -29,6 +32,7 @@ OPENAI_API_KEY= os.getenv('OPENAI_API_KEY')
 # load models
 import torch
 from PIL import Image
+import numpy as np
 import sys
 
 from diffusers import QwenImagePipeline, QwenImageEditPipeline
@@ -430,7 +434,7 @@ class IntentionAnalyzer:
             User responses: {json.dumps(user_responses, indent=2)}
             Current creativity level: {creativity_level.value}
             
-            You are a Flux.1-dev prompt expert. Refine the given prompt from user. Focus on aligning the given prompt and generating the best quality image. Please make sure all the mentioned objects are remained. 
+            You are a Qwen-Image prompt expert. Refine the given prompt from user. Focus on aligning the given prompt and generating the best quality image. Please make sure all the mentioned objects are retained. 
             Steps: 
             0. Convert negative statements into positive ones by rephrasing to focus on what should be included, without mentioning what should not be included. Examples:
                * "Do not wear a coat" -> "Wear a light sweater"
@@ -499,36 +503,56 @@ class IntentionAnalyzer:
             self.logger.error(f"Response was: {response}")
             raise
 
-def load_models():
-    """Pre-load models with proper GPU memory management"""
+def load_models(use_quantization=True):
+    """Pre-load models with proper GPU memory management
+    
+    Args:
+        use_quantization (bool): Whether to use quantization and FP16 for reduced memory usage.
+            If False, models will be loaded in FP32 without quantization for higher precision.
+    """
     global qwen_image_pipe, qwen_edit_pipe
 
     # Clear any existing GPU memory
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+    
+    # Set dtype and quantization config based on flag
+    dtype = torch.float16 if use_quantization else torch.float32
+    quantization_config = None
+    if use_quantization:
+        quantization_config = PipelineQuantizationConfig(
+            quant_mapping={
+            "transformer": DiffusersBitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16),
+            "text_encoder_2": TransformersBitsAndBytesConfig(
+                load_in_4bit=True, compute_dtype=torch.bfloat16
+            ),
+        }
+            )
 
     try:
-        print("Loading Qwen Image model...")
+        print(f"Loading Qwen Image model {'with' if use_quantization else 'without'} quantization...")
         with torch.cuda.device(0):  # Primary GPU
             qwen_image_pipe = QwenImagePipeline.from_pretrained(
                 "Qwen/Qwen-Image", 
-                torch_dtype=torch.float16,  # More widely supported than bfloat16
+                torch_dtype=dtype,
+                quantization_config=quantization_config,
                 device_map="cuda"
             )
 
-        print("Loading Qwen Image Edit model...")
+        print(f"Loading Qwen Image Edit model {'with' if use_quantization else 'without'} quantization...")
         with torch.cuda.device(0):  # Keep on same GPU for better memory management
             qwen_edit_pipe = QwenImageEditPipeline.from_pretrained(
                 "Qwen/Qwen-Image-Edit", 
-                torch_dtype=torch.float16,
-                device_map={"": "cuda:1"}
+                torch_dtype=dtype,
+                quantization_config=quantization_config,
+                device_map="cuda"
             )
 
         # Enable model memory efficiency
-        if hasattr(qwen_image_pipe, "enable_model_cpu_offload"):
-            qwen_image_pipe.enable_model_cpu_offload()
-        if hasattr(qwen_edit_pipe, "enable_model_cpu_offload"):
-            qwen_edit_pipe.enable_model_cpu_offload()
+        # if hasattr(qwen_image_pipe, "enable_model_cpu_offload"):
+        #     qwen_image_pipe.enable_model_cpu_offload()
+        # if hasattr(qwen_edit_pipe, "enable_model_cpu_offload"):
+        #     qwen_edit_pipe.enable_model_cpu_offload()
 
     except RuntimeError as e:
         if "out of memory" in str(e):
@@ -571,6 +595,9 @@ def generate_with_qwen_image(prompt: str, seed: int) -> str:
                 max_sequence_length=512,
                 generator=generator
             ).images[0]
+            
+        # Normalize image before saving
+        image = normalize_image(image)
 
         # Set output path based on regeneration count
         if config.regeneration_count > 0:
@@ -584,8 +611,8 @@ def generate_with_qwen_image(prompt: str, seed: int) -> str:
         return output_path
             
     except Exception as e:
-        logger.error(f"Error in Flux generation: {str(e)}")
-        return f"Error generating image with Flux: {str(e)}"
+        logger.error(f"Error in Qwen-Image generation: {str(e)}")
+        return f"Error generating image with Qwen-Image: {str(e)}"
 
 
 @tool("Qwen-Image-Edit")
@@ -639,6 +666,9 @@ def generate_with_qwen_edit(prompt: str, existing_image_dir: str, seed: int = 42
                 generator=generator
             ).images[0]
 
+        # Normalize image before saving
+        result = normalize_image(result)
+
         # Save the result
         result.save(output_path)
         logger.debug(f"Successfully generated image at: {output_path}\n")
@@ -676,48 +706,36 @@ class ModelSelector:
 
             Note:
             - Best cases for selecting Qwen-Image:
-                - If the prompt is general, the Qwen-Image model should be selected.
-
-                - For atmosphere/mood/lighting/style improvements or enhancing visual qualities, select Qwen-Image and create a generating_prompt that:
-                * Integrates specific atmospheric details into the original prompt
-                * Uses descriptive language for the desired mood or visual effect
-                * Examples:
-                    - "make it more dramatic" -> "A dramatic scene with high contrast lighting, deep shadows, and intense atmosphere, showing [original elements]"
-                    - "enhance cozy feeling" -> "A warm and intimate setting with soft, golden lighting and comfortable ambiance, featuring [original elements]"
-                    - "more professional atmosphere" -> "A polished and sophisticated environment with clean lines and professional lighting, showcasing [original elements]"
-                    - "enhance ghostly features" -> "A haunting scene with ethereal, translucent ghostly elements that emit a subtle glow, featuring [original elements]"
-                    - "make waves more dramatic" -> "A scene with powerful, dynamic waves with detailed foam and spray, showing [original elements]"
-                    - "increase texture detail" -> "A scene with highly detailed surfaces, emphasizing intricate textures and fine details in [original elements]"
-                    - "enhance lighting" -> "A scene with dramatic lighting effects, creating bold contrasts and atmospheric illumination for [original elements]"
-                
-                - For rearrangement improvements (e.g., repositioning elements), select Flux.1-dev and create a generating_prompt that combines the original prompt with the improvement suggestions to ensure proper placement
+                - For general image generation without reference images
+                - For atmosphere/mood/lighting/style improvements or enhancing visual qualities:
+                    * Integrates specific atmospheric details into the original prompt
+                    * Uses descriptive language for the desired mood or visual effect
+                    * Examples:
+                        - "make it more dramatic" -> "A dramatic scene with high contrast lighting, deep shadows, and intense atmosphere, showing [original elements]"
+                        - "enhance cozy feeling" -> "A warm and intimate setting with soft, golden lighting and comfortable ambiance, featuring [original elements]"
+                        - "more professional atmosphere" -> "A polished and sophisticated environment with clean lines and professional lighting, showcasing [original elements]"
+                        - "enhance ghostly features" -> "A haunting scene with ethereal, translucent ghostly elements that emit a subtle glow, featuring [original elements]"
+                        - "make waves more dramatic" -> "A scene with powerful, dynamic waves with detailed foam and spray, showing [original elements]"
+                        - "increase texture detail" -> "A scene with highly detailed surfaces, emphasizing intricate textures and fine details in [original elements]"
+                        - "enhance lighting" -> "A scene with dramatic lighting effects, creating bold contrasts and atmospheric illumination for [original elements]"
                     
             - Best cases for selecting Qwen-Image-Edit:
-                - For high-quality inpainting and object removal, select Qwen-Image-Edit. Best use cases include:
-                    * Precise object removal with natural background filling (e.g., "remove the person from the image", "erase the car")
-                    * Adding completely new objects to specific regions (e.g., "add a realistic cat to the sofa", "place a vase of flowers on the table")
-                    * When adding an object, provide the exact bounding box coordinates of the referring object to be added in the format of "[x1,y1,x2,y2]" while the coordinates for the referred removing object can be None (The given image resolution is 1024x1024)
-                    * Seamless texture replacement (e.g., "replace the brick wall with wood paneling", "change the grass to sand")
-                    * Complex scene modifications that require natural blending (e.g., "add a window to the wall", "place a door in the hallway")
+                - When there's a reference image to edit
+                - For precise object removal with natural background filling
+                - For adding new objects to specific regions
+                - For seamless texture replacement
+                - For complex scene modifications requiring natural blending
                     
-            - For generating_prompt:
-                - Converting negative statements into positive ones by rephrasing to focus on what should be included, without mentioning what should not be included. Examples:
+            - Guidelines for generating_prompt:
+                - Convert negative statements into positive ones:
                     * "Do not wear a coat" -> "Wear a light sweater"
                     * "No trees in background" -> "Clear blue sky background"
                     * "Remove the hat" -> "Show full hair styling"
                     * "Not smiling" -> "Serious expression"
                     * "No bright colors" -> "Muted, subtle tones"
-                - For ensuring main subjects appear in the image, structure the prompt to:
-                    Start with the primary focal element and its key attributes, then build outward with supporting elements, describing their spatial relationships and interactions. Connect elements with clear positional language and natural transitions. For example, instead of:
-                    (x) "A vintage armchair. A sleeping cat. A Persian rug. Antique books. Wooden shelves."
-                    Write:
-                    (v) "A vintage leather armchair dominates the corner, its worn texture catching the ambient light. A cat sleeps peacefully on the Persian rug spread before it, while antique books line the wooden shelves along the wall."
-
-            - The item "task_type" in returned JSON should be "text-guided" or "object-removal" for PowerPaint.
-                * When the task is about adding or replacing an object, the "task_type" should be "text-guided". Its full name is "text-guided inpainting".
-                * When the task is about removing an object, the "task_type" should be "object-removal".
-
-            - The item "bbox_coordinates" in returned JSON should be the bounding box coordinates of the object to be added in the format of "[x1,y1,x2,y2]" while the coordinates for the referred removing object can be None (The given image resolution is 1024x1024)
+                - Structure prompts with clear spatial relationships:
+                    * Bad: "A vintage armchair. A sleeping cat. A Persian rug. Antique books. Wooden shelves."
+                    * Good: "A vintage leather armchair dominates the corner, its worn texture catching the ambient light. A cat sleeps peacefully on the Persian rug spread before it, while antique books line the wooden shelves along the wall."
             
             - Return a JSON with:
             {{
@@ -728,101 +746,49 @@ class ModelSelector:
                 "confidence_score": float  # 0.0 to 1.0
             }}
 
-            # Example 1 (Enhancing Dramatic Effects):
+            # Example 1 (General Image Generation):
             - Given prompt: "An ancient dragon perched on a cliff overlooking a stormy ocean."
             - Given improvement: "Make the storm more intense and add more detail to the dragon's scales."
             - Returned JSON:
                 {{
-                    "selected_model": "Flux.1-dev",
+                    "selected_model": "Qwen-Image",
                     "reference_content_image": None,
                     "generating_prompt": "A colossal ancient dragon with highly detailed, weathered scales perches on a jagged cliff, its wings partially extended. Each scale features deep grooves and sharp ridges, reflecting flickers of ambient lightning. The background consists of a stormy ocean with hurricane-force winds and diagonal rain streaks. The sky is filled with dense, turbulent storm clouds, illuminated by intermittent lightning flashes that cast stark highlights on the dragon's body. Towering waves below crash violently against the rocky shore, creating dynamic white foam and spray patterns. The dragon is positioned as the dominant foreground element, with a cinematic contrast between its dark silhouette and the electric blue highlights from the storm.",
-                    "unwanted_object": None,
-                    "task_type": None,
-                    "bbox_coordinates": None,
-                    "reasoning": "Enhancing dramatic effects and textures of existing elements is best handled by Flux.1-dev with detailed descriptions in the prompt",
+                    "reasoning": "This is a general image generation task that requires detailed atmospheric effects and texturing, best handled by Qwen-Image",
                     "confidence_score": 0.96
                 }}
 
-            # Example 2 (Object Removal):
-            - Given improvement: "Remove one person from the image"
+            # Example 2 (Image Editing):
+            - Given prompt: "Remove one person from the image"
             - Returned JSON:
                 {{
-                    "selected_model": "PowerPaint",
+                    "selected_model": "Qwen-Image-Edit",
                     "reference_content_image": "PATH/TO/GIVEN_IMAGE",
                     "generating_prompt": "Remove one person from the image",
-                    "unwanted_object": "one person",
-                    "task_type": "object-removal",
-                    "bbox_coordinates": "[250, 100, 750, 300]",
-                    "reasoning": "The improvement requires a localized object removal, which is best handled by PowerPaint",
+                    "reasoning": "This task requires precise object removal and background inpainting, which Qwen-Image-Edit excels at",
                     "confidence_score": 0.98
                 }}
 
-            # Example 3 (Object Replacement):
-            - Given prompt: "Replace the cat on the left with a rabbit"
+            # Example 3 (Style Enhancement):
+            - Given prompt: "A portrait of a woman without makeup, no jewelry, not smiling, with no bright colors"
             - Returned JSON:
                 {{
-                    "selected_model": "PowerPaint",
-                    "reference_content_image": "PATH/TO/GIVEN_IMAGE",
-                    "generating_prompt": "add a rabbit",
-                    "unwanted_object": "a cat",
-                    "task_type": "text-guided",
-                    "bbox_coordinates": "[140, 100, 200, 160]",
-                    "reasoning": "The prompt requires replacing a specific object in a localized region, which is ideal for PowerPaint",
-                    "confidence_score": 0.95
-                }}
-                
-            # Example 4 (Object Addition):
-            - Given prompt: "Add a vase of flowers on the empty table"
-            - Returned JSON:
-                {{
-                    "selected_model": "PowerPaint",
-                    "reference_content_image": "PATH/TO/GIVEN_IMAGE",
-                    "generating_prompt": "a beautiful vase filled with colorful flowers including roses, tulips, and daisies",
-                    "unwanted_object": None,
-                    "task_type": "text-guided",
-                    "bbox_coordinates": "[320, 250, 420, 400]",
-                    "reasoning": "The prompt requires adding a detailed object to a specific empty region, which PowerPaint excels at with its high-quality inpainting capabilities",
-                    "confidence_score": 0.97
-                }}
-
-            # Example 5 (Enhancing Dramatic Effects):
-            - Given prompt: "A vast ocean under a cloudy sky, with waves rolling toward the shore."
-            - Given improvement: "Make the waves more dramatic and add more texture to the sea"
-            - Returned JSON:
-                {{
-                    "selected_model": "Flux.1-dev",
+                    "selected_model": "Qwen-Image",
                     "reference_content_image": None,
-                    "generating_prompt": "A vast and powerful ocean surging under a storm-laden sky, with towering, dynamic waves rolling toward the shore. The sea surface is richly textured with intricate patterns of foam, swirling currents, and sharp, cresting waves. The water reflects deep blues and grays, with highlights of white spray and turbulence adding a sense of movement. The waves interact dynamically, forming peaks and troughs with complex rippling effects, creating an immersive and dramatic seascape.",
-                    "unwanted_object": None,
-                    "task_type": None,
-                    "bbox_coordinates": None,
-                    "reasoning": "Enhancing dramatic effects and textures of existing elements is best handled by Flux.1-dev with detailed descriptions in the prompt",
-                    "confidence_score": 0.96
-                }}
-
-            # Example 6 (Converting Negative to Positive Statements):
-            - Given prompt: "A portrait of a woman without makeup, no jewelry, not smiling, with no bright colors in the background"
-            - Returned JSON:
-                {{
-                    "selected_model": "Flux.1-dev",
-                    "reference_content_image": None,
-                    "generating_prompt": "Professional portrait photography of a woman with natural, bare skin showing realistic texture and subtle imperfections. She gazes directly at the camera with a serene, thoughtful expression. Her hair is styled simply, falling naturally around her shoulders. She wears a plain, solid-colored top in a neutral tone. The background features soft bokeh in muted sage green and warm gray tones. The lighting is soft, diffused studio lighting from the front-left, creating gentle shadows that accentuate her facial structure. The composition follows the rule of thirds with shallow depth of field, shot with a 85mm lens at f/2.8.",
-                    "unwanted_object": None,
-                    "task_type": None,
-                    "bbox_coordinates": None,
-                    "reasoning": "This prompt requires generating a portrait with specific stylistic elements. The negative statements have been converted to positive descriptions that achieve the same intent - focusing on natural appearance, minimal styling, neutral tones, and a contemplative expression rather than stating what should not be included.",
+                    "generating_prompt": "Professional portrait photography of a woman with natural, bare skin showing realistic texture and subtle imperfections. She gazes directly at the camera with a serene, thoughtful expression. Her hair is styled simply, falling naturally around her shoulders. She wears a plain, solid-colored top in a neutral tone. The background features soft bokeh in muted sage green and warm gray tones. The lighting is soft, diffused studio lighting from the front-left, creating gentle shadows that accentuate her facial structure.",
+                    "reasoning": "This is a new portrait generation with specific style requirements, best handled by Qwen-Image",
                     "confidence_score": 0.95
                 }}
             """
         else:
-            return f"""Generate the most suitable prompt for the given task for model Flux.1-dev.
+            return f"""Generate the most suitable prompt for the given task using Qwen-Image.
             
-            # Flux.1-dev: {self.available_models['Flux.1-dev']}
+            # Qwen-Image: {self.available_models['Qwen-Image']}
 
-            Note:
-            - For atmosphere/mood/lighting/style improvements or enhancing visual qualities, create a generating_prompt that:
-                * Integrates specific atmospheric details into the original prompt
-                * Uses descriptive language for the desired mood or visual effect
+            Guidelines for generating_prompt:
+            - For atmosphere/mood/lighting/style improvements:
+                * Integrate specific atmospheric details into the original prompt
+                * Use descriptive language for the desired mood or visual effect
                 * Examples:
                     - "make it more dramatic" -> "A dramatic scene with high contrast lighting, deep shadows, and intense atmosphere, showing [original elements]"
                     - "enhance cozy feeling" -> "A warm and intimate setting with soft, golden lighting and comfortable ambiance, featuring [original elements]"
@@ -832,71 +798,56 @@ class ModelSelector:
                     - "increase texture detail" -> "A scene with highly detailed surfaces, emphasizing intricate textures and fine details in [original elements]"
                     - "enhance lighting" -> "A scene with dramatic lighting effects, creating bold contrasts and atmospheric illumination for [original elements]"
              
-            - For generating_prompt:
-                - Converting negative statements into positive ones by rephrasing to focus on what should be included, without mentioning what should not be included. Examples:
-                    * "Do not wear a coat" -> "Wear a light sweater"
-                    * "No trees in background" -> "Clear blue sky background"
-                    * "Remove the hat" -> "Show full hair styling"
-                    * "Not smiling" -> "Serious expression"
-                    * "No bright colors" -> "Muted, subtle tones"
-                - For ensuring main subjects appear in the image, structure the prompt to:
-                    Start with the primary focal element and its key attributes, then build outward with supporting elements, describing their spatial relationships and interactions. Connect elements with clear positional language and natural transitions. For example, instead of:
-                    (x) "A vintage armchair. A sleeping cat. A Persian rug. Antique books. Wooden shelves."
-                    Write:
-                    (v) "A vintage leather armchair dominates the corner, its worn texture catching the ambient light. A cat sleeps peacefully on the Persian rug spread before it, while antique books line the wooden shelves along the wall."
+            - Convert negative statements to positive ones:
+                * "Do not wear a coat" -> "Wear a light sweater"
+                * "No trees in background" -> "Clear blue sky background"
+                * "Remove the hat" -> "Show full hair styling"
+                * "Not smiling" -> "Serious expression"
+                * "No bright colors" -> "Muted, subtle tones"
+                
+            - Structure prompts with clear spatial relationships:
+                * Bad: "A vintage armchair. A sleeping cat. A Persian rug. Antique books. Wooden shelves."
+                * Good: "A vintage leather armchair dominates the corner, its worn texture catching the ambient light. A cat sleeps peacefully on the Persian rug spread before it, while antique books line the wooden shelves along the wall."
 
-            - Return a JSON with:
+            Return a JSON with:
             {{
-                "selected_model": "model_name",
+                "selected_model": "Qwen-Image",
                 "reference_content_image": "path to the reference content image",
                 "generating_prompt": "model-specific prompt",
-                "unwanted_object": None,
-                "task_type": None,
-                "bbox_coordinates": None,
                 "reasoning": "Detailed explanation of why this model was chosen",
                 "confidence_score": float  # 0.0 to 1.0
             }}
 
-            # Example 1 (Enhancing Dramatic Effects):
+            # Example 1 (Scene with Atmosphere):
             - Given prompt: "An ancient dragon perched on a cliff overlooking a stormy ocean."
-            - Given improvement: "Make the storm more intense and add more detail to the dragon's scales."
             - Returned JSON:
                 {{
-                    "selected_model": "Flux.1-dev",
+                    "selected_model": "Qwen-Image",
                     "reference_content_image": None,
                     "generating_prompt": "A colossal ancient dragon with highly detailed, weathered scales perches on a jagged cliff, its wings partially extended. Each scale features deep grooves and sharp ridges, reflecting flickers of ambient lightning. The background consists of a stormy ocean with hurricane-force winds and diagonal rain streaks. The sky is filled with dense, turbulent storm clouds, illuminated by intermittent lightning flashes that cast stark highlights on the dragon's body. Towering waves below crash violently against the rocky shore, creating dynamic white foam and spray patterns. The dragon is positioned as the dominant foreground element, with a cinematic contrast between its dark silhouette and the electric blue highlights from the storm.",
-                    "unwanted_object": None,
-                    "task_type": None,
-                    "bbox_coordinates": None,
-                    "reasoning": "Enhancing dramatic effects and textures of existing elements is best handled by Flux.1-dev with detailed descriptions in the prompt",
+                    "reasoning": "The prompt requires detailed atmospheric effects and complex texturing which Qwen-Image excels at",
                     "confidence_score": 0.96
                 }}
 
-            # Example 2 (Detailed Scene Creation):
+            # Example 2 (Detailed Scene):
             - Given prompt: "A medieval fantasy marketplace"
             - Returned JSON:
                 {{
-                    "selected_model": "Flux.1-dev",
+                    "selected_model": "Qwen-Image",
                     "reference_content_image": None,
                     "generating_prompt": "A vibrant medieval marketplace in a fantasy setting, photographed in natural daylight. Wooden stalls with colorful canopies are arranged across a cobblestone plaza. Merchants display practical goods - rolls of fabric in earth tones, handcrafted pottery, and baskets of fresh produce. Several visitors in period-appropriate attire browse the marketplace. Stone and timber buildings with distinctive medieval architecture frame the scene. The atmosphere is lively yet realistic, with soft shadows cast by the midday sun. The image has a balanced composition with the marketplace as the clear focal point.",
-                    "unwanted_object": None,
-                    "task_type": None,
-                    "bbox_coordinates": None,
-                    "reasoning": "This prompt requires creating a scene with specific elements while avoiding excessive details that could lead to hallucinations. The description focuses on realistic, historically plausible elements with clear spatial relationships and limited complexity, which helps Flux.1-dev generate a more coherent and accurate image",
+                    "reasoning": "This prompt requires creating a detailed scene with clear spatial relationships and balanced composition",
                     "confidence_score": 0.98
                 }}
 
-            # Example 3 (Converting Negative to Positive Statements):
-            - Given prompt: "A portrait of a woman without makeup, no jewelry, not smiling, with no bright colors in the background"
+            # Example 3 (Portrait with Style):
+            - Given prompt: "A portrait of a woman without makeup, no jewelry, not smiling, with no bright colors"
             - Returned JSON:
                 {{
-                    "selected_model": "Flux.1-dev",
+                    "selected_model": "Qwen-Image",
                     "reference_content_image": None,
-                    "generating_prompt": "Professional portrait photography of a woman with natural, bare skin showing realistic texture and subtle imperfections. She gazes directly at the camera with a serene, thoughtful expression. Her hair is styled simply, falling naturally around her shoulders. She wears a plain, solid-colored top in a neutral tone. The background features soft bokeh in muted sage green and warm gray tones. The lighting is soft, diffused studio lighting from the front-left, creating gentle shadows that accentuate her facial structure. The composition follows the rule of thirds with shallow depth of field, shot with a 85mm lens at f/2.8.",
-                    "unwanted_object": None,
-                    "task_type": None,
-                    "bbox_coordinates": None,
-                    "reasoning": "This prompt requires generating a portrait with specific stylistic elements. The negative statements have been converted to positive descriptions that achieve the same intent - focusing on natural appearance, minimal styling, neutral tones, and a contemplative expression rather than stating what should not be included.",
+                    "generating_prompt": "Professional portrait photography of a woman with natural, bare skin showing realistic texture and subtle imperfections. She gazes directly at the camera with a serene, thoughtful expression. Her hair is styled simply, falling naturally around her shoulders. She wears a plain, solid-colored top in a neutral tone. The background features soft bokeh in muted sage green and warm gray tones. The lighting is soft, diffused studio lighting from the front-left, creating gentle shadows that accentuate her facial structure.",
+                    "reasoning": "This prompt requires generating a portrait with specific style elements while maintaining natural appearance",
                     "confidence_score": 0.95
                 }}
             """
@@ -948,20 +899,18 @@ class ModelSelector:
 
         except Exception as e:
             self.logger.error(f"Error in model selection: {str(e)}. Return basic configuration.")
-            # Fallback to Flux.1-dev with basic configuration
+            # Fallback to Qwen-Image with basic configuration
             return {
-                "selected_model": "Flux.1-dev",
+                "selected_model": "Qwen-Image",
                 "reference_content_image": None,
                 "generating_prompt": config.prompt_understanding.get('refined_prompt', config.prompt_understanding['original_prompt']),
-                "unwanted_object": None,
-                "task_type": None,
-                "bbox_coordinates": None,
                 "reasoning": "Fallback selection due to error in model selection process",
                 "confidence_score": 0.5
             }
 
     def _parse_llm_response(self, response) -> Dict[str, Any]:
-        """Parse LLM response to dictionary."""
+        """Parse LLM response to dictionary. Handles string and dictionary response types
+        and provides a fallback configuration if parsing fails."""
         try:
             if isinstance(response.content, str):
                 return json.loads(response.content)
@@ -972,14 +921,11 @@ class ModelSelector:
         except json.JSONDecodeError as e:
             self.logger.error(f"Failed to parse LLM response: {str(e)}")
             self.logger.error(f"Raw response: {response.content}")
-            # Return fallback configuration
+            # Return fallback configuration with minimal required fields
             return {
-                "selected_model": "Flux.1-dev",
+                "selected_model": "Qwen-Image",
                 "reference_content_image": None,
                 "generating_prompt": config.prompt_understanding.get('refined_prompt', config.prompt_understanding['original_prompt']),
-                "unwanted_object": None,
-                "task_type": None,
-                "bbox_coordinates": None,
                 "reasoning": "Fallback selection due to JSON parsing error",
                 "confidence_score": 0.5
             }
@@ -1148,12 +1094,6 @@ def model_selection_node(state: MessagesState) -> Command[str]:
             else:
                 current_config["reference_content_image"] = None
         current_config["generating_prompt"] = model_selection["generating_prompt"]
-        current_config["unwanted_object"] = model_selection["unwanted_object"]
-        current_config["task_type"] = model_selection["task_type"]
-        if "bbox_coordinates" in model_selection:
-            current_config["bbox_coordinates"] = model_selection["bbox_coordinates"]
-        else:
-            current_config["bbox_coordinates"] = None
         current_config["reasoning"] = model_selection["reasoning"]
         current_config["confidence_score"] = model_selection["confidence_score"]
 
@@ -1163,8 +1103,6 @@ def model_selection_node(state: MessagesState) -> Command[str]:
         gen_image_path = execute_model(
             model_name=current_config['selected_model'],
             prompt=current_config['generating_prompt'],
-            task_type=current_config['task_type'],
-            mask_dir=current_config['reference_mask_dir'],
             reference_content_image=current_config['reference_content_image'],
         )
         
@@ -1201,6 +1139,31 @@ def model_selection_node(state: MessagesState) -> Command[str]:
         
         # If not a regeneration, raise the error
         raise
+
+def normalize_image(image):
+    """Normalize image data to ensure valid pixel values before saving.
+    
+    Args:
+        image: A PIL Image or tensor image
+    
+    Returns:
+        PIL Image with valid pixel values
+    """
+    if isinstance(image, torch.Tensor):
+        # If it's a tensor, convert to numpy first
+        image = image.cpu().numpy()
+    
+    if isinstance(image, np.ndarray):
+        # Handle NaN values
+        image = np.nan_to_num(image, nan=0.5)
+        # Clamp values to [0, 1] range
+        image = np.clip(image, 0, 1)
+        # Convert to PIL Image if necessary
+        if image.dtype != np.uint8:
+            image = (image * 255).round().astype(np.uint8)
+        image = Image.fromarray(image)
+    
+    return image
 
 def execute_model(model_name: str, prompt: str, reference_content_image: str = None) -> str:
     """Execute the selected model and return paths to generated images."""
@@ -1455,17 +1418,22 @@ def track_llm_call(llm_func, llm_type, *args, **kwargs):
     llm_token_counts[llm_type].append((prompt_tokens, completion_tokens, total_tokens))
     return response
 
-def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, open_llm_model="mistralai/Mistral-Small-3.1-24B-Instruct-2503", open_llm_host="0.0.0.0", open_llm_port="8000", calculate_latency=False):
+def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, open_llm_model="mistralai/Mistral-Small-3.1-24B-Instruct-2503", open_llm_host="0.0.0.0", open_llm_port="8000", calculate_latency=False, use_quantization=True):
     """Main CLI entry point."""
-    # Check CUDA availability
+    # Check CUDA availability and initialize
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is not available. This code requires a GPU to run.")
+    
+    # Initialize primary CUDA device
+    torch.cuda.init()
+    torch.cuda.set_device(0)
     
     # Print GPU info
     gpu_name = torch.cuda.get_device_name(0)
     gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
     print(f"\nUsing GPU: {gpu_name}")
     print(f"Available GPU memory: {gpu_memory:.2f} GB")
+    print(f"Number of available GPUs: {torch.cuda.device_count()}")
     # Declare globals
     global logger, config
     global llm_latencies, llm_token_counts
@@ -1479,7 +1447,7 @@ def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, o
     workflow = create_t2i_workflow()
 
     # Load models after logger and save_dir are set
-    load_models()
+    load_models(use_quantization)
     print("Models loaded")
 
     # store benchmark dir into one list
@@ -1595,7 +1563,7 @@ def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, o
 
             # start timing
             torch.cuda.reset_peak_memory_stats(0)
-            torch.cuda.reset_peak_memory_stats(1)
+            # torch.cuda.reset_peak_memory_stats(1)
             start_time = time.time()
 
             logger.info("\n" + "="*83)
@@ -1623,9 +1591,17 @@ def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, o
                 multi_turn_turns.append(config.regeneration_count + 1)
             total_time += inference_time
             inference_times.append(inference_time)
-            mem0 = torch.cuda.max_memory_allocated(0) / 1024**3
-            mem1 = torch.cuda.max_memory_allocated(1) / 1024**3
-            max_gpu_memories.append(max(mem0, mem1))
+            
+            # Safely collect GPU memory stats
+            try:
+                mem_stats = []
+                for device in range(torch.cuda.device_count()):
+                    mem_stats.append(torch.cuda.max_memory_allocated(device) / 1024**3)
+                max_gpu_memories.append(max(mem_stats) if mem_stats else 0)
+            except RuntimeError as e:
+                logger.warning(f"Could not collect GPU memory stats: {e}")
+                max_gpu_memories.append(0)
+                
             logger.info(f"Inference time for prompt {key}: {inference_time:.4f} seconds")
 
             logger.info("Workflow completed")    
