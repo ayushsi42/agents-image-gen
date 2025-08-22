@@ -35,7 +35,11 @@ from PIL import Image
 import numpy as np
 import sys
 
-from diffusers import QwenImagePipeline, QwenImageEditPipeline
+from diffusers import (
+    QwenImagePipeline, QwenImageEditPipeline,
+    QwenImageTransformer2DModel
+)
+from transformers import Qwen2_5_VLForConditionalGeneration
 
 import re
 import json
@@ -516,37 +520,81 @@ def load_models(use_quantization=True):
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     
-    # Set dtype and quantization config based on flag
-    dtype = torch.float16 if use_quantization else torch.float32
-    quantization_config = None
-    if use_quantization:
-        quantization_config = PipelineQuantizationConfig(
-            quant_mapping={
-            "transformer": DiffusersBitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16),
-            "text_encoder_2": TransformersBitsAndBytesConfig(
-                load_in_4bit=True, compute_dtype=torch.bfloat16
-            ),
-        }
-            )
-
     try:
-        print(f"Loading Qwen Image model {'with' if use_quantization else 'without'} quantization...")
-        with torch.cuda.device(0):  # Primary GPU
-            qwen_image_pipe = QwenImagePipeline.from_pretrained(
-                "Qwen/Qwen-Image", 
-                torch_dtype=dtype,
-                quantization_config=quantization_config,
-                device_map="cuda"
+        if use_quantization:
+            # Standard quantization config for Qwen-Image
+            image_config = DiffusersBitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.bfloat16,
             )
+            
+            print("Loading Qwen Image model with quantization...")
+            with torch.cuda.device(0):  # Primary GPU
+                qwen_image_pipe = QwenImagePipeline.from_pretrained(
+                    "Qwen/Qwen-Image", 
+                    torch_dtype=torch.bfloat16,
+                    quantization_config=image_config,
+                    device_map="cuda"
+                )
 
-        print(f"Loading Qwen Image Edit model {'with' if use_quantization else 'without'} quantization...")
-        with torch.cuda.device(0):  # Keep on same GPU for better memory management
-            qwen_edit_pipe = QwenImageEditPipeline.from_pretrained(
-                "Qwen/Qwen-Image-Edit", 
-                torch_dtype=dtype,
-                quantization_config=quantization_config,
-                device_map="cuda"
+            print("Loading Qwen Image Edit model with specialized quantization...")
+            model_id = "Qwen/Qwen-Image-Edit"
+            
+            # Specialized quantization for transformer
+            transformer_config = DiffusersBitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                llm_int8_skip_modules=["transformer_blocks.0.img_mod"],
             )
+            transformer = QwenImageTransformer2DModel.from_pretrained(
+                model_id,
+                subfolder="transformer",
+                quantization_config=transformer_config,
+                torch_dtype=torch.bfloat16,
+            )
+            transformer = transformer.to("cpu")
+
+            # Specialized quantization for text encoder
+            text_encoder_config = TransformersBitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.bfloat16,
+            )
+            text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                model_id,
+                subfolder="text_encoder",
+                quantization_config=text_encoder_config,
+                torch_dtype=torch.bfloat16,
+            )
+            text_encoder = text_encoder.to("cpu")
+
+            # Create pipeline with specialized components
+            qwen_edit_pipe = QwenImageEditPipeline.from_pretrained(
+                model_id,
+                transformer=transformer,
+                text_encoder=text_encoder,
+                torch_dtype=torch.bfloat16
+            )
+            qwen_edit_pipe.to("cuda")
+            
+        else:
+            print("Loading Qwen Image model without quantization...")
+            with torch.cuda.device(0):
+                qwen_image_pipe = QwenImagePipeline.from_pretrained(
+                    "Qwen/Qwen-Image", 
+                    torch_dtype=torch.float32,
+                    device_map="cuda"
+                )
+
+            print("Loading Qwen Image Edit model without quantization...")
+            with torch.cuda.device(0):
+                qwen_edit_pipe = QwenImageEditPipeline.from_pretrained(
+                    "Qwen/Qwen-Image-Edit", 
+                    torch_dtype=torch.float32,
+                    device_map="cuda"
+                )
 
         # Enable model memory efficiency
         # if hasattr(qwen_image_pipe, "enable_model_cpu_offload"):
