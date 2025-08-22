@@ -10,3 +10,5 @@ cd https://github.com/ayushsi42/agents-image-gen.git
 conda env create -f environment.yaml
 pip install git+https://github.com/huggingface/diffusers
 pip install --upgrade "transformers>=4.44.0"
+pip install bitsandbytes
+pip install torchao

@@ -522,21 +522,54 @@ def load_models(use_quantization=True):
     
     try:
         if use_quantization:
-            # Standard quantization config for Qwen-Image
-            image_config = DiffusersBitsAndBytesConfig(
+            
+            print("Loading Qwen Image model with quantization...")
+            model_id = "Qwen/Qwen-Image"
+            torch_dtype = torch.bfloat16
+            device = "cuda"
+            
+            quantization_config = DiffusersBitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                llm_int8_skip_modules=["transformer_blocks.0.img_mod"],
+            )
+
+            transformer = QwenImageTransformer2DModel.from_pretrained(
+                model_id,
+                subfolder="transformer",
+                quantization_config=quantization_config,
+                torch_dtype=torch_dtype,
+            )
+            transformer = transformer.to("cpu")
+
+            quantization_config = TransformersBitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_quant_type="nf4",
                 bnb_4bit_compute_dtype=torch.bfloat16,
             )
-            
-            print("Loading Qwen Image model with quantization...")
-            with torch.cuda.device(0):  # Primary GPU
-                qwen_image_pipe = QwenImagePipeline.from_pretrained(
-                    "Qwen/Qwen-Image", 
-                    torch_dtype=torch.bfloat16,
-                    quantization_config=image_config,
-                    device_map="cuda"
-                )
+
+            text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                model_id,
+                subfolder="text_encoder",
+                quantization_config=quantization_config,
+                torch_dtype=torch_dtype,
+            )
+
+            text_encoder = text_encoder.to("cpu")
+
+            qwen_image_pipe = QwenImagePipeline.from_pretrained(
+                model_id, transformer=transformer, text_encoder=text_encoder, torch_dtype=torch_dtype
+            )
+
+            qwen_image_pipe.to("cuda")
+
+            print("GPU Name:", torch.cuda.get_device_name(0))
+            print("Memory Allocated:", round(torch.cuda.memory_allocated(0)/1024**3, 2), "GB")
+            print("Memory Cached:", round(torch.cuda.memory_reserved(0)/1024**3, 2), "GB")
+            print("Total Memory:", round(torch.cuda.get_device_properties(0).total_memory/1024**3, 2), "GB")
+            print("Clearing CUDA cache...")
+            torch.cuda.empty_cache()
 
             print("Loading Qwen Image Edit model with specialized quantization...")
             model_id = "Qwen/Qwen-Image-Edit"
@@ -552,7 +585,7 @@ def load_models(use_quantization=True):
                 model_id,
                 subfolder="transformer",
                 quantization_config=transformer_config,
-                torch_dtype=torch.bfloat16,
+                torch_dtype=torch.bfloat16
             )
             transformer = transformer.to("cpu")
 
@@ -562,13 +595,13 @@ def load_models(use_quantization=True):
                 bnb_4bit_quant_type="nf4",
                 bnb_4bit_compute_dtype=torch.bfloat16,
             )
-            text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                model_id,
-                subfolder="text_encoder",
-                quantization_config=text_encoder_config,
-                torch_dtype=torch.bfloat16,
-            )
-            text_encoder = text_encoder.to("cpu")
+            # text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            #     model_id,
+            #     subfolder="text_encoder",
+            #     quantization_config=text_encoder_config,
+            #     torch_dtype=torch.bfloat16
+            # )
+            # text_encoder = text_encoder.to("cpu")
 
             # Create pipeline with specialized components
             qwen_edit_pipe = QwenImageEditPipeline.from_pretrained(
@@ -584,7 +617,7 @@ def load_models(use_quantization=True):
             with torch.cuda.device(0):
                 qwen_image_pipe = QwenImagePipeline.from_pretrained(
                     "Qwen/Qwen-Image", 
-                    torch_dtype=torch.float32,
+                    torch_dtype=torch.bfloat16,
                     device_map="cuda"
                 )
 
@@ -592,7 +625,7 @@ def load_models(use_quantization=True):
             with torch.cuda.device(0):
                 qwen_edit_pipe = QwenImageEditPipeline.from_pretrained(
                     "Qwen/Qwen-Image-Edit", 
-                    torch_dtype=torch.float32,
+                    torch_dtype=torch.bfloat16,
                     device_map="cuda"
                 )
 
@@ -679,6 +712,10 @@ def generate_with_qwen_edit(prompt: str, existing_image_dir: str, seed: int = 42
     """
     global qwen_edit_pipe
     
+    # qwen_image_pipe.to("cpu")
+    # qwen_edit_pipe.to("cuda")
+
+
     logger.info(f"Executing Qwen Image Edit with prompt: {prompt}; seed: {seed}")
     
     # Set up output path
@@ -714,6 +751,8 @@ def generate_with_qwen_edit(prompt: str, existing_image_dir: str, seed: int = 42
                 generator=generator
             ).images[0]
 
+        # qwen_edit_pipe.to("cpu")
+        # qwen_image_pipe.to("cuda")
         # Normalize image before saving
         result = normalize_image(result)
 
