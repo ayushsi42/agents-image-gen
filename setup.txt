@@ -5,8 +5,8 @@ source ~/.bashrc
 
 sudo apt install gh
 gh auth login
-git clone 
-cd https://github.com/ayushsi42/agents-image-gen.git
+git clone https://github.com/ayushsi42/agents-image-gen.git
+cd agents-image-gen
 conda env create -f environment.yaml
 pip install git+https://github.com/huggingface/diffusers
 pip install --upgrade "transformers>=4.44.0"
