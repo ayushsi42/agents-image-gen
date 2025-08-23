@@ -115,8 +115,8 @@ def generate_image(pipe, prompt, seed, image_index, save_dir):
                 prompt,
                 height=1024,
                 width=1024,
-                guidance_scale=3.5,
-                num_inference_steps=28,
+                true_cfg_scale=4.0,
+                num_inference_steps=50,
                 max_sequence_length=512,
                 generator=generator
             ).images[0]
