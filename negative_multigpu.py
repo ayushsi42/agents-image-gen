@@ -59,14 +59,14 @@ def load_qwen_image_model(use_quantization=True):
             qwen_image_pipe = QwenImagePipeline.from_pretrained(
                 model_id, transformer=transformer, text_encoder=text_encoder, torch_dtype=torch_dtype
             )
-            qwen_image_pipe.to("cuda")
+            qwen_image_pipe.to(f"cuda:{torch.cuda.current_device()}")
             
         else:
             print("Loading Qwen Image model without quantization...")
             qwen_image_pipe = QwenImagePipeline.from_pretrained(
                 "Qwen/Qwen-Image", 
                 torch_dtype=torch.bfloat16,
-                device_map="cuda"
+                device_map=f"cuda:{torch.cuda.current_device()}"
             )
 
         print("GPU Name:", torch.cuda.get_device_name(0))
@@ -106,11 +106,8 @@ def generate_image(pipe, prompt, seed, image_index, save_dir):
             torch.cuda.empty_cache()
 
         # Set up generator with seed
-        generator = torch.Generator("cuda").manual_seed(seed)
-        
-        print(f"Generating image for: {prompt[:50]}...")
-
-        negative_prompt = "Gorgeous colors, overexposed, static, blurred details, subtitles, style, artwork, painting, image, still, overall gray, worst quality, low quality, JPEG compression residue, ugly, mutilated, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, malformed limbs, fused fingers, still image, cluttered background, three legs, crowded background, walking backwards"
+        generator = torch.Generator(f"cuda:{torch.cuda.current_device()}").manual_seed(seed)
+        negative_prompt = "Gorgeous , static, blucolors, overexposedrred details, subtitles, style, artwork, painting, image, still, overall gray, worst quality, low quality, JPEG compression residue, ugly, mutilated, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, malformed limbs, fused fingers, still image, cluttered background, three legs, crowded background, walking backwards"
         
         with torch.inference_mode():
             image = pipe(
@@ -181,6 +178,10 @@ def main():
                        help='Use quantization for memory efficiency')
     parser.add_argument('--start_idx', type=int, default=0,
                        help='Start index for resuming generation')
+    parser.add_argument('--end_idx', type=int, default=None,
+                       help='End index for data splitting')
+    parser.add_argument('--gpu_id', type=int, default=0,
+                       help='GPU ID to use for this process')
     
     args = parser.parse_args()
     
@@ -190,12 +191,12 @@ def main():
     
     # Initialize CUDA
     torch.cuda.init()
-    torch.cuda.set_device(0)
+    torch.cuda.set_device(args.gpu_id)
     
     # Print GPU info
-    gpu_name = torch.cuda.get_device_name(0)
-    gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
-    print(f"\nUsing GPU: {gpu_name}")
+    gpu_name = torch.cuda.get_device_name(args.gpu_id)
+    gpu_memory = torch.cuda.get_device_properties(args.gpu_id).total_memory / 1024**3
+    print(f"\nUsing GPU {args.gpu_id}: {gpu_name}")
     print(f"Available GPU memory: {gpu_memory:.2f} GB")
     
     # Create output directory
@@ -205,6 +206,18 @@ def main():
     print(f"Loading benchmark from: {args.benchmark_path}")
     prompts, seeds, image_indices = load_benchmark(args.benchmark_path)
     print(f"Loaded {len(prompts)} prompts")
+    
+    # Apply data splitting
+    if args.end_idx is not None:
+        prompts = prompts[args.start_idx:args.end_idx]
+        seeds = seeds[args.start_idx:args.end_idx]
+        image_indices = image_indices[args.start_idx:args.end_idx]
+        print(f"Processing slice [{args.start_idx}:{args.end_idx}] = {len(prompts)} prompts")
+    else:
+        prompts = prompts[args.start_idx:]
+        seeds = seeds[args.start_idx:]
+        image_indices = image_indices[args.start_idx:]
+        print(f"Processing from index {args.start_idx} = {len(prompts)} prompts")
     
     # Load model
     print("Loading Qwen-Image model...")
@@ -216,11 +229,11 @@ def main():
     failed_generations = 0
     
     # Generate images
-    print(f"Starting generation from index {args.start_idx}...")
+    print(f"Starting generation...")
     for i, (prompt, seed, img_idx) in enumerate(tqdm(
-        zip(prompts[args.start_idx:], seeds[args.start_idx:], image_indices[args.start_idx:]),
-        desc="Generating images",
-        total=len(prompts) - args.start_idx
+        zip(prompts, seeds, image_indices),
+        desc=f"GPU {args.gpu_id} generating images",
+        total=len(prompts)
     )):
         start_time = time.time()
         
@@ -240,13 +253,15 @@ def main():
         # Save progress periodically
         if (i + 1) % 10 == 0:
             progress = {
-                "completed": i + 1 + args.start_idx,
+                "gpu_id": args.gpu_id,
+                "completed": i + 1,
                 "total": len(prompts),
                 "successful": successful_generations,
                 "failed": failed_generations,
                 "avg_time": sum(inference_times) / len(inference_times)
             }
-            with open(os.path.join(args.output_dir, "progress.json"), "w") as f:
+            progress_file = os.path.join(args.output_dir, f"progress_gpu_{args.gpu_id}.json")
+            with open(progress_file, "w") as f:
                 json.dump(progress, f, indent=2)
     
     # Final statistics
@@ -254,9 +269,9 @@ def main():
     avg_time = total_time / len(inference_times) if inference_times else 0
     
     print("\n" + "="*50)
-    print("GENERATION COMPLETE")
+    print(f"GENERATION COMPLETE ON GPU {args.gpu_id}")
     print("="*50)
-    print(f"Total prompts: {len(prompts)}")
+    print(f"Total prompts processed: {len(prompts)}")
     print(f"Successful generations: {successful_generations}")
     print(f"Failed generations: {failed_generations}")
     print(f"Average time per image: {avg_time:.2f} seconds")
@@ -265,6 +280,9 @@ def main():
     
     # Save final statistics
     final_stats = {
+        "gpu_id": args.gpu_id,
+        "start_idx": args.start_idx,
+        "end_idx": args.end_idx,
         "total_prompts": len(prompts),
         "successful_generations": successful_generations,
         "failed_generations": failed_generations,
@@ -273,7 +291,8 @@ def main():
         "inference_times": inference_times
     }
     
-    with open(os.path.join(args.output_dir, "final_stats.json"), "w") as f:
+    stats_file = os.path.join(args.output_dir, f"final_stats_gpu_{args.gpu_id}.json")
+    with open(stats_file, "w") as f:
         json.dump(final_stats, f, indent=2)
 
 if __name__ == "__main__":
