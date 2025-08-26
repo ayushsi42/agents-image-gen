@@ -21,6 +21,7 @@ import argparse
 import random
 from utils import setup_logging
 
+
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -71,7 +72,7 @@ class T2IConfig:
 
         # Prompt understanding configuration
         self.prompt_understanding = {
-            "creativity_level": CreativityLevel.MEDIUM if human_in_loop else CreativityLevel.HIGH,
+            "creativity_level": CreativityLevel.MEDIUM if human_in_loop else CreativityLevel.MEDIUM,
             "original_prompt": "",
             "prompt_analysis": "",  # JSON string
             "questions": None,
@@ -434,7 +435,15 @@ class IntentionAnalyzer:
             User responses: {json.dumps(user_responses, indent=2)}
             Current creativity level: {creativity_level.value}
             
-            You are a Qwen-Image prompt expert. Refine the given prompt from user. Focus on aligning the given prompt and generating the best quality image. Please make sure all the mentioned objects are retained. 
+            You are a Qwen-Image prompt expert. Your PRIMARY GOAL is to stay faithful to the original prompt while incorporating user clarifications. CRITICAL: The refined prompt must preserve the core intent, subjects, and atmosphere of the original prompt.
+            
+            GROUNDING PRINCIPLES:
+            - PRESERVE ALL original subjects, objects, and key elements mentioned in the original prompt
+            - MAINTAIN the original scene's core atmosphere, mood, and context
+            - ONLY ADD details that directly support or clarify the original prompt
+            - AVOID introducing new subjects, objects, or concepts not implied by the original
+            - USER RESPONSES should only clarify ambiguities, not replace original elements
+            
             Steps: 
             0. Convert negative statements into positive ones by rephrasing to focus on what should be included, without mentioning what should not be included. Examples:
                * "Do not wear a coat" -> "Wear a light sweater"
@@ -442,16 +451,19 @@ class IntentionAnalyzer:
                * "Remove the hat" -> "Show full hair styling"
                * "Not smiling" -> "Serious expression"
                * "No bright colors" -> "Muted, subtle tones"
-            1. Incorporating all information: based on the original prompt, i) adding more details from user responses, and ii) if the creativity_level is MEDIUM or HIGH, adding the creative_fill details from analysis
-            2. If there is reference image, must keep the its directory
-            3. Suggest creativity level based on detail completeness of user responses:
+            1. START with the original prompt as the foundation - preserve its exact wording where possible
+            2. INCORPORATE user responses ONLY to resolve specific ambiguities identified in the analysis
+            3. ADD minimal creative details from analysis ONLY if they directly support the original prompt's intent
+            4. ENSURE the refined prompt sounds like an enhanced version of the original, not a different prompt
+            5. If there is reference image, must keep the its directory
+            6. Suggest creativity level based on detail completeness of user responses:
                - LOW: If user provided very specific details for most aspects
                - MEDIUM: If some details are provided but some flexibility is needed
                - HIGH: If many details are still open to interpretation
             
             Return a JSON with:
             {{
-                "refined_prompt": "A well-structured, coherent prompt that integrates the original prompt, user responses, and analysis. Ensure it maintains clarity, follows natural language conventions, and effectively conveys the intended request.",
+                "refined_prompt": "A refined version that stays closely grounded to the original prompt while incorporating user clarifications. The refined prompt should read as a natural enhancement of the original, not a replacement.",
                 "suggested_creativity_level": "LOW|MEDIUM|HIGH",
                 "reasoning": "Explain why the suggested creativity level was chosen based on the detail completeness of user responses."
             }}
@@ -461,8 +473,16 @@ class IntentionAnalyzer:
             Original prompt: "{original_prompt}"
             Analysis: {json.dumps(analysis, indent=2)}
             Creativity level: {creativity_level.value}
+
+            You are a Qwen prompt expert. Your PRIMARY GOAL is to stay faithful to the original prompt while resolving ambiguities. CRITICAL: The refined prompt must preserve the core intent, subjects, and atmosphere of the original prompt.
             
-            You are a Flux.1-dev prompt expert. Refine the given prompt from user. Focus on aligning the given prompt and generating the best quality image. Please make sure all the mentioned objects are remained. 
+            GROUNDING PRINCIPLES:
+            - PRESERVE ALL original subjects, objects, and key elements mentioned in the original prompt
+            - MAINTAIN the original scene's core atmosphere, mood, and context
+            - ONLY ADD details that directly support or clarify the original prompt
+            - AVOID introducing new subjects, objects, or concepts not clearly implied by the original
+            - Creative filling should ENHANCE, not REPLACE or OVERSHADOW original elements
+            
             Steps: 
             0. Convert negative statements into positive ones by rephrasing to focus on what should be included, without mentioning what should not be included. Examples:
                * "Do not wear a coat" -> "Wear a light sweater"
@@ -470,15 +490,16 @@ class IntentionAnalyzer:
                * "Remove the hat" -> "Show full hair styling"
                * "Not smiling" -> "Serious expression"
                * "No bright colors" -> "Muted, subtle tones"
-            1. If creativity_level is MEDIUM or HIGH, fill in missing details creatively 
-            2. Maintain the user's original intent while adding clarity, which can be referenced from the creative_fill from analysis
-            3. Ensure all ambiguous elements are resolved according to creativity level
-            4. If there is reference image, must keep the its directory
+            1. START with the original prompt as the foundation - preserve its core structure and intent
+            2. RESOLVE ambiguous elements using creative_fill from analysis, but only for true ambiguities
+            3. ADD minimal supporting details ONLY if creativity_level is MEDIUM or HIGH AND they enhance the original concept
+            4. ENSURE the refined prompt feels like a clearer version of the original, not a different scene
+            5. If there is reference image, must keep the its directory
             
             Return a JSON with:
             {{
-                "refined_prompt": "A well-structured, coherent prompt that integrates the original prompt, user responses, and analysis. Ensure it maintains clarity, follows natural language conventions, and effectively conveys the intended request.",
-                "reasoning": "Explain why the refined prompt was created."
+                "refined_prompt": "A refined version that stays closely grounded to the original prompt while resolving necessary ambiguities. The result should read as a natural clarification of the original, maintaining its core essence.",
+                "reasoning": "Explain how the refinement preserves the original prompt's intent while addressing ambiguities."
             }}
             """
         
@@ -747,11 +768,13 @@ def generate_with_qwen_image(prompt: str, negative_prompt: str, seed: int) -> st
         
         with torch.inference_mode():
             # Use native negative prompt support
+            # print("Negative Prompt: ",negative_prompt)
+            # print("Positive Prompt: ",prompt)
             image = qwen_image_pipe(
                 prompt=prompt,
                 negative_prompt=negative_prompt,
-                height=1024,
-                width=1024,
+                height=1328,
+                width=1328,
                 true_cfg_scale=4.0,
                 num_inference_steps=50,
                 max_sequence_length=512,
@@ -825,11 +848,15 @@ def generate_with_qwen_edit(prompt: str, negative_prompt: str, existing_image_di
         
         with torch.inference_mode():
             # Use native negative prompt support
+            # print("Negative Prompt: ",negative_prompt)
+            # print("Positive Prompt: ",prompt)
             result = qwen_edit_pipe(
                 prompt=prompt,
                 negative_prompt=negative_prompt,
                 image=input_img,
-                true_cfg_scale=guidance_scale,
+                height=1328,
+                width=1328,
+                true_cfg_scale=4.0,
                 num_inference_steps=50,
                 generator=generator
             ).images[0]
@@ -901,6 +928,9 @@ class ModelSelector:
                 - For complex scene modifications requiring natural blending
                     
             - Guidelines for generating_prompt:
+                - CRITICAL: Stay faithful to the original prompt's core intent, subjects, and atmosphere
+                - PRESERVE all original subjects, objects, and key elements mentioned in the original prompt
+                - ENHANCE clarity and detail while maintaining the original scene's essence
                 - Convert negative statements into positive ones:
                     * "Do not wear a coat" -> "Wear a light sweater"
                     * "No trees in background" -> "Clear blue sky background"
@@ -910,6 +940,7 @@ class ModelSelector:
                 - Structure prompts with clear spatial relationships:
                     * Bad: "A vintage armchair. A sleeping cat. A Persian rug. Antique books. Wooden shelves."
                     * Good: "A vintage leather armchair dominates the corner, its worn texture catching the ambient light. A cat sleeps peacefully on the Persian rug spread before it, while antique books line the wooden shelves along the wall."
+                - The generating_prompt should read like an enhanced version of the original, not a replacement
             
             - Guidelines for negative_prompt:
                 - Include quality-related terms: "low quality, blurry, distorted, pixelated"
@@ -971,6 +1002,9 @@ class ModelSelector:
             # Qwen-Image: {self.available_models['Qwen-Image']}
 
             Guidelines for generating_prompt:
+            - CRITICAL: Stay faithful to the original prompt's core intent, subjects, and atmosphere
+            - PRESERVE all original subjects, objects, and key elements mentioned in the original prompt
+            - ENHANCE clarity and detail while maintaining the original scene's essence
             - For atmosphere/mood/lighting/style improvements:
                 * Integrate specific atmospheric details into the original prompt
                 * Use descriptive language for the desired mood or visual effect
@@ -993,6 +1027,8 @@ class ModelSelector:
             - Structure prompts with clear spatial relationships:
                 * Bad: "A vintage armchair. A sleeping cat. A Persian rug. Antique books. Wooden shelves."
                 * Good: "A vintage leather armchair dominates the corner, its worn texture catching the ambient light. A cat sleeps peacefully on the Persian rug spread before it, while antique books line the wooden shelves along the wall."
+            
+            - The generating_prompt should read like an enhanced version of the original, not a replacement
 
             Guidelines for negative_prompt:
             - Include quality-related terms: "low quality, blurry, distorted, pixelated"
@@ -1052,18 +1088,29 @@ class ModelSelector:
         """Create the task-specific prompt based on current state."""
         if config.regeneration_count > 0:
             prev_config = config.get_prev_config()
+            current_config = config.get_current_config()
+            reference_image_path = current_config.get('reference_content_image')
+            
             if prev_config['user_feedback']:
-                return f"""Analyze this regeneration request:
+                return f"""Analyze this regeneration request - IMPORTANT: A reference image is available from the previous generation.
+                
+                Reference image available: {reference_image_path}
                 Previous result: {prev_config['gen_image_path']}
                 User feedback: {prev_config['user_feedback']}
                 Ultimate guiding principle prompt: {config.prompt_understanding['original_prompt']}
-                First Round Prompt Understanding: {config.prompt_understanding}"""
+                First Round Prompt Understanding: {config.prompt_understanding}
+                
+                Since a reference image is available, consider Qwen-Image-Edit for targeted improvements and modifications based on user feedback."""
             else:
-                return f"""Analyze this regeneration request:
+                return f"""Analyze this regeneration request - IMPORTANT: A reference image is available from the previous generation.
+                
+                Reference image available: {reference_image_path}
                 Previous result: {prev_config['gen_image_path']}
                 Improvement needed: {prev_config['improvement_suggestions']}
                 Ultimate guiding principle prompt: {config.prompt_understanding['original_prompt']}
-                First Round Prompt Understanding: {config.prompt_understanding}"""
+                First Round Prompt Understanding: {config.prompt_understanding}
+                
+                Since a reference image is available, consider Qwen-Image-Edit for targeted improvements and modifications."""
         else:
             if config.is_human_in_loop:
                 return f"""Analyze this initial generation request:
@@ -1313,12 +1360,24 @@ def model_selection_node(state: MessagesState) -> Command[str]:
         
         # Update current config with model selection
         current_config["selected_model"] = model_selection["selected_model"]
+        logger.info(f"Selected model: {model_selection['selected_model']}")
+        logger.info(f"Model selection reasoning: {model_selection.get('reasoning', 'No reasoning provided')}")
+        
         if config.regeneration_count == 0:
-            # if not regen, when creating new config, it would put the prev gen image as the reference content image
+            # First generation - set reference content image if provided
             if "reference_content_image" in model_selection:
                 current_config["reference_content_image"] = model_selection["reference_content_image"]
             else:
                 current_config["reference_content_image"] = None
+            logger.info(f"First generation - reference image: {current_config['reference_content_image']}")
+        else:
+            # Regeneration - ensure the reference content image is preserved from add_regeneration_config
+            logger.info(f"Regeneration attempt {config.regeneration_count}")
+            logger.info(f"Current reference image: {current_config.get('reference_content_image')}")
+            # Only update if the LLM explicitly provided a different reference
+            if "reference_content_image" in model_selection and model_selection["reference_content_image"]:
+                current_config["reference_content_image"] = model_selection["reference_content_image"]
+                logger.info(f"Updated reference image from LLM: {current_config['reference_content_image']}")
         current_config["generating_prompt"] = model_selection["generating_prompt"]
         current_config["negative_prompt"] = model_selection["negative_prompt"]  # Add negative prompt to config
         current_config["reasoning"] = model_selection["reasoning"]
@@ -1393,6 +1452,31 @@ def normalize_image(image):
     
     return image
 
+
+def polish_prompt_en(original_prompt):
+    
+    SYSTEM_PROMPT = '''
+You are a Prompt optimizer designed to rewrite user inputs into high-quality Prompts that are more complete and expressive while preserving the original meaning.
+Task Requirements:
+1. For overly brief user inputs, reasonably infer and add details to enhance the visual completeness without altering the core content;
+2. Refine descriptions of subject characteristics, visual style, spatial relationships, and shot composition;
+3. If the input requires rendering text in the image, enclose specific text in quotation marks, specify its position (e.g., top-left corner, bottom-right corner) and style. This text should remain unaltered and not translated;
+4. Match the Prompt to a precise, niche style aligned with the user's intent. If unspecified, choose the most appropriate style (e.g., realistic photography style);
+5. Please ensure that the Rewritten Prompt is less than 200 words.
+'''
+    original_prompt = original_prompt.strip()
+    prompt = f"{SYSTEM_PROMPT}\n\nUser Input: {original_prompt}\n\n Rewritten Prompt:"
+    magic_prompt = "Ultra HD, 4K, cinematic composition"
+            
+    response = track_llm_call(llm.invoke, "polish_prompt", [
+                    ("system", SYSTEM_PROMPT),
+                    ("human", f"User Input: {original_prompt}\n\n Rewritten Prompt:")
+                ])
+    polished_prompt = response.content.strip()
+    polished_prompt = polished_prompt.replace("\n", " ")
+            
+    return polished_prompt + " " + magic_prompt
+
 def execute_model(model_name: str, prompt: str, negative_prompt: str, reference_content_image: str = None) -> str:
     """Execute the selected model and return paths to generated images."""
     global qwen_image_pipe, qwen_edit_pipe
@@ -1408,11 +1492,18 @@ def execute_model(model_name: str, prompt: str, negative_prompt: str, reference_
     else:
         # random seed
         seed = random.randint(0, 1000000)
+    
+    polished_prompt = polish_prompt_en(prompt)
+    # print("Polished Prompt:", polished_prompt)
+    print("="*50)
+    print("Prompt",prompt)
+    print("Polished Prompt:", polished_prompt)
+    print("Negative Prompt:", negative_prompt)
+    print("="*50)
 
-    # Execute the selected model
     if model_name == "Qwen-Image":
         t0 = time.time()
-        result = selector.tools[model_name].invoke({"prompt": prompt, "negative_prompt": negative_prompt, "seed": seed})
+        result = selector.tools[model_name].invoke({"prompt": polished_prompt, "negative_prompt": negative_prompt, "seed": seed})
         t1 = time.time()
         model_inference_times["Qwen-Image"].append(t1 - t0)
         return result
@@ -1420,7 +1511,7 @@ def execute_model(model_name: str, prompt: str, negative_prompt: str, reference_
         t0 = time.time()
         logger.info(f"existing_image_dir: {reference_content_image}")
             
-        result = selector.tools[model_name].invoke({"prompt": prompt, "negative_prompt": negative_prompt, "existing_image_dir": reference_content_image, "seed": seed, "guidance_scale": 4.0})
+        result = selector.tools[model_name].invoke({"prompt": polished_prompt, "negative_prompt": negative_prompt, "existing_image_dir": reference_content_image, "seed": seed, "guidance_scale": 4.0})
         t1 = time.time()
         model_inference_times["Qwen-Image-Edit"].append(t1 - t0)
         return result
@@ -1740,14 +1831,16 @@ def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, o
             "refine_prompt": [], 
             "model_selection": [], 
             "evaluation": [],
-            "negative_prompt_generation": []
+            "negative_prompt_generation": [],
+            "polish_prompt": []
         }
         llm_token_counts = {
             "intention_analysis": [], 
             "refine_prompt": [], 
             "model_selection": [], 
             "evaluation": [],
-            "negative_prompt_generation": []
+            "negative_prompt_generation": [],
+            "polish_prompt": []
         }
         single_turn_count = 0
         multi_turn_count = 0

@@ -28,9 +28,11 @@ Detect elements that need clarification due to:
 - Missing reference images: If reference images are typically expected but not provided.
 
 3. Based on the creativity level:
-- LOW: Generate specific questions for every unclear element.
-- MEDIUM: Fill in common details automatically and ask for critical clarifications.
-- HIGH: Creatively fill in all missing details while maintaining coherence.
+- LOW: Generate specific questions for every unclear element. Creative fill should be minimal and only for obvious implications.
+- MEDIUM: Fill in common, widely accepted details automatically and ask for critical clarifications. Creative fill should be conservative and directly related to the original prompt.
+- HIGH: Creatively fill in missing details while maintaining coherence with the original prompt. Creative fill should enhance, not replace or overshadow original elements.
+
+IMPORTANT: Creative fills must always preserve the core intent and atmosphere of the original prompt. Avoid introducing elements that change the fundamental nature of the scene.
 
 4. JSON Output Structure
 Return your analysis in the following format:
