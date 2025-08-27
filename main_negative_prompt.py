@@ -268,15 +268,15 @@ def initialize_llms(use_open_llm=False, open_llm_model="mistralai/Mistral-Small-
     else:
         # Using Qwen-2.5
         llm = ChatOpenAI(
-            model="qwen/qwen-2.5-coder-32b-instruct:free",
+            model="qwen/qwen2.5-vl-32b-instruct:free",
             openai_api_base="https://openrouter.ai/api/v1"
         )
         llm_json = ChatOpenAI(
-            model="qwen/qwen-2.5-coder-32b-instruct:free",
+            model="qwen/qwen2.5-vl-32b-instruct:free",
             openai_api_base="https://openrouter.ai/api/v1",
             response_format={"type": "json_object"}
         )
-        print("Initialized GPT-4o-mini")
+        print("Initialized Qwen-32B-VL Instruct")
     
     return llm, llm_json
 
@@ -1684,7 +1684,7 @@ def evaluation_node(state: MessagesState) -> Command[str]:
             )
         ]
         
-        # Get evaluation from GPT-4
+        # Get evaluation from Qwen-VL
         evaluation_result = track_llm_call(llm_json.invoke, "evaluation", evaluation_prompt)
         evaluation_data = json.loads(evaluation_result.content)
 
@@ -2139,7 +2139,7 @@ if __name__ == "__main__":
     parser.add_argument('--benchmark_name', default='cool_sample.txt', type=str, help='Path to the benchmark directory: cool_sample.txt, GenAIBenchmark/genai_image_seed.json, ambiguous_seed.txt')
     parser.add_argument('--human_in_the_loop', action='store_true', help='Use human in the loop')
     parser.add_argument('--model_version', default='vRelease', type=str, help= 'Model version')
-    parser.add_argument('--use_open_llm', action='store_true', help='Use open source LLM instead of GPT-4o-mini')
+    parser.add_argument('--use_open_llm', action='store_true', help='Use open source LLM.')
     parser.add_argument('--open_llm_model', default='mistralai/Mistral-Small-3.1-24B-Instruct-2503', type=str, 
                         help='Open LLM model to use (mistralai/Mistral-Small-3.1-24B-Instruct-2503, Qwen/Qwen2.5-VL-3B-Instruct, Qwen/Qwen2.5-VL-7B-Instruct)')
     parser.add_argument('--open_llm_host', default='0.0.0.0', type=str, help='Host address for the open LLM server')
