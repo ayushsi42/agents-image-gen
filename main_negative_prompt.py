@@ -255,9 +255,16 @@ def initialize_llms(use_open_llm=False, open_llm_model="mistralai/Mistral-Small-
         
         print(f"Initialized OpenSource LLM: {open_llm_model}")
     else:
-        # Using GPT-4o-mini
-        llm = ChatOpenAI(model="gpt-4o-mini")
-        llm_json = ChatOpenAI(model="gpt-4o-mini", response_format={"type": "json_object"})
+        # Using Qwen-2.5
+        llm = ChatOpenAI(
+            model="qwen/qwen-2.5-coder-32b-instruct:free",
+            openai_api_base="https://openrouter.ai/api/v1"
+        )
+        llm_json = ChatOpenAI(
+            model="qwen/qwen-2.5-coder-32b-instruct:free",
+            openai_api_base="https://openrouter.ai/api/v1",
+            response_format={"type": "json_object"}
+        )
         print("Initialized GPT-4o-mini")
     
     return llm, llm_json
