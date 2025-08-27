@@ -51,6 +51,7 @@ qwen_image_pipe = None
 qwen_edit_pipe = None
 
 class CreativityLevel(Enum):
+    LOW = "low"      # Ask for every unclear element, minimal creative fill
     MEDIUM = "medium"  # Fill some details, ask for important ones
     HIGH = "high"    # Autonomously fill in most details
 
@@ -72,7 +73,7 @@ class T2IConfig:
 
         # Prompt understanding configuration
         self.prompt_understanding = {
-            "creativity_level": CreativityLevel.MEDIUM if human_in_loop else CreativityLevel.MEDIUM,
+            "creativity_level": None,  # Will be determined dynamically based on prompt analysis
             "original_prompt": "",
             "prompt_analysis": "",  # JSON string
             "questions": None,
@@ -130,7 +131,10 @@ class T2IConfig:
         """Convert config to dictionary for storage."""
         # Convert the CreativityLevel enum to its string value
         prompt_understanding = self.prompt_understanding.copy()
-        prompt_understanding["creativity_level"] = prompt_understanding["creativity_level"].value
+        if prompt_understanding["creativity_level"] is not None:
+            prompt_understanding["creativity_level"] = prompt_understanding["creativity_level"].value
+        else:
+            prompt_understanding["creativity_level"] = "MEDIUM"  # Default fallback
 
         # Ensure prompt_analysis is stored as a dictionary, not a JSON string
         if isinstance(prompt_understanding["prompt_analysis"], str):
@@ -198,9 +202,16 @@ class T2IConfig:
         
         # Load prompt understanding config
         instance.prompt_understanding = data["prompt_understanding"]
-        instance.prompt_understanding["creativity_level"] = CreativityLevel(
-            instance.prompt_understanding["creativity_level"]
-        )
+        creativity_level_value = instance.prompt_understanding["creativity_level"]
+        if creativity_level_value is not None and creativity_level_value != "":
+            try:
+                instance.prompt_understanding["creativity_level"] = CreativityLevel(creativity_level_value)
+            except ValueError:
+                # Fallback to MEDIUM if invalid value
+                instance.prompt_understanding["creativity_level"] = CreativityLevel.MEDIUM
+        else:
+            # If None or empty, will be determined dynamically later
+            instance.prompt_understanding["creativity_level"] = None
 
         # Load regeneration configs
         instance.regeneration_configs = data["regeneration_configs"]
@@ -275,6 +286,99 @@ class IntentionAnalyzer:
         self.llm = llm
         self.llm_json = llm.bind(response_format={"type": "json_object"})
         self.logger = logger
+
+    def determine_creativity_level(self, prompt: str) -> CreativityLevel:
+        """Analyze the prompt to automatically determine the appropriate creativity level."""
+        self.logger.debug(f"Determining creativity level for prompt: '{prompt}'")
+        
+        creativity_analysis_prompt = """You are an expert at analyzing image generation prompts to determine the appropriate creativity level.
+
+Analyze the given prompt and determine the creativity level based on these criteria:
+
+HIGH Creativity Level (system should be highly creative and autonomous):
+- Very brief or vague prompts (e.g., "a cat", "landscape", "portrait")
+- Abstract concepts or artistic requests (e.g., "surreal dream", "impressionist style")
+- Prompts with many undefined elements or lacking specific details
+- Creative or artistic enhancement requests (e.g., "make it more dramatic", "artistic interpretation")
+- Prompts that invite interpretation and artistic freedom
+
+MEDIUM Creativity Level (balanced approach):
+- Moderately detailed prompts with some specifics but room for enhancement
+- Prompts with clear subject but undefined context or style
+- Standard scene descriptions that could benefit from creative details
+- Prompts with mix of specific and general elements
+
+LOW Creativity Level (stick closely to specifications):
+- Highly detailed and specific prompts with clear requirements
+- Technical or precise requests (e.g., "headshot photo", "product photography")
+- Prompts with explicit style, composition, and detail specifications
+- Professional or commercial image requests
+- Prompts that leave little room for interpretation
+
+Return JSON with:
+{
+    "creativity_level": "LOW|MEDIUM|HIGH",
+    "reasoning": "Detailed explanation of why this creativity level was chosen",
+    "prompt_characteristics": {
+        "detail_level": "low|medium|high",
+        "specificity": "vague|moderate|precise",
+        "artistic_freedom": "constrained|balanced|open"
+    }
+}
+
+Examples:
+
+Input: "a cat"
+Output: {
+    "creativity_level": "HIGH",
+    "reasoning": "Very brief prompt with minimal details. Requires significant creative interpretation for breed, pose, setting, lighting, style, etc.",
+    "prompt_characteristics": {"detail_level": "low", "specificity": "vague", "artistic_freedom": "open"}
+}
+
+Input: "Professional headshot of a 30-year-old woman with brown hair, wearing a navy blue blazer, neutral background, studio lighting"
+Output: {
+    "creativity_level": "LOW", 
+    "reasoning": "Highly specific prompt with clear requirements for age, appearance, clothing, background, and lighting. Little room for creative interpretation.",
+    "prompt_characteristics": {"detail_level": "high", "specificity": "precise", "artistic_freedom": "constrained"}
+}
+
+Input: "A medieval marketplace in a fantasy setting"
+Output: {
+    "creativity_level": "MEDIUM",
+    "reasoning": "Clear subject and setting but many details undefined (architecture style, time of day, characters, atmosphere, specific elements). Balanced between guidance and creative freedom.",
+    "prompt_characteristics": {"detail_level": "medium", "specificity": "moderate", "artistic_freedom": "balanced"}
+}"""
+
+        try:
+            response = track_llm_call(self.llm_json.invoke, "creativity_determination", [
+                ("system", creativity_analysis_prompt),
+                ("human", f"Analyze this prompt and determine creativity level: '{prompt}'")
+            ])
+            
+            if isinstance(response.content, str):
+                result = json.loads(response.content)
+            else:
+                result = response.content
+                
+            creativity_level_str = result.get("creativity_level", "MEDIUM")
+            reasoning = result.get("reasoning", "Default reasoning")
+            
+            # Convert string to enum
+            if creativity_level_str == "HIGH":
+                creativity_level = CreativityLevel.HIGH
+            elif creativity_level_str == "LOW":
+                creativity_level = CreativityLevel.LOW
+            else:
+                creativity_level = CreativityLevel.MEDIUM
+                
+            self.logger.info(f"Determined creativity level: {creativity_level.value}")
+            self.logger.info(f"Reasoning: {reasoning}")
+            
+            return creativity_level
+            
+        except Exception as e:
+            self.logger.error(f"Error in creativity determination: {str(e)}. Defaulting to MEDIUM.")
+            return CreativityLevel.MEDIUM
 
     def identify_image_path(self, prompt: str) -> str:
         from urllib.parse import urlparse
@@ -407,6 +511,18 @@ class IntentionAnalyzer:
         
         for ambiguous_element in analysis["ambiguous_elements"]:
             questions.extend(ambiguous_element["suggested_questions"])
+        
+        # For LOW creativity, ask for ALL unclear elements (more questions)
+        if creativity_level == CreativityLevel.LOW:
+            # Add additional detail-oriented questions
+            if "identified_elements" in analysis:
+                for element_category, element_data in analysis["identified_elements"].items():
+                    if isinstance(element_data, dict) and element_data.get("needs_clarification", False):
+                        questions.append(f"Please specify details for {element_category}: {element_data.get('description', '')}")
+            
+            # Always ask questions for LOW creativity unless there are really none
+            if not questions:
+                questions.append("Please provide any additional specific details you'd like to include.")
         
         if not questions:
             self.logger.debug("No questions needed - returning SUFFICIENT_DETAIL")
@@ -1226,7 +1342,14 @@ def intention_understanding_node(state: MessagesState) -> Command[str]:
     # First interaction - analyze the prompt
     if len(state["messages"]) == 1:
         config.prompt_understanding["original_prompt"] = last_message.content
-        logger.info("Step 1: Analyzing prompt")
+        logger.info("Step 1: Determining creativity level based on prompt")
+        
+        # Determine creativity level based on prompt analysis
+        determined_creativity_level = analyzer.determine_creativity_level(last_message.content)
+        config.prompt_understanding["creativity_level"] = determined_creativity_level
+        logger.info(f"Determined creativity level: {determined_creativity_level.value}")
+        
+        logger.info("Step 2: Analyzing prompt")
         try:
             # Analyze prompt
             analysis = analyzer.analyze_prompt(last_message.content, config.prompt_understanding["creativity_level"])
@@ -1839,7 +1962,8 @@ def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, o
             "model_selection": [], 
             "evaluation": [],
             "negative_prompt_generation": [],
-            "polish_prompt": []
+            "polish_prompt": [],
+            "creativity_determination": []
         }
         llm_token_counts = {
             "intention_analysis": [], 
@@ -1847,7 +1971,8 @@ def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, o
             "model_selection": [], 
             "evaluation": [],
             "negative_prompt_generation": [],
-            "polish_prompt": []
+            "polish_prompt": [],
+            "creativity_determination": []
         }
         single_turn_count = 0
         multi_turn_count = 0
