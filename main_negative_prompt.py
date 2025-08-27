@@ -268,11 +268,11 @@ def initialize_llms(use_open_llm=False, open_llm_model="mistralai/Mistral-Small-
     else:
         # Using Qwen-2.5
         llm = ChatOpenAI(
-            model="qwen/qwen2.5-vl-32b-instruct:free",
+            model="qwen/qwen2.5-vl-72b-instruct",
             openai_api_base="https://openrouter.ai/api/v1"
         )
         llm_json = ChatOpenAI(
-            model="qwen/qwen2.5-vl-32b-instruct:free",
+            model="qwen/qwen2.5-vl-72b-instruct",
             openai_api_base="https://openrouter.ai/api/v1",
             response_format={"type": "json_object"}
         )
