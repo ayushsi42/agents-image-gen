@@ -20,6 +20,7 @@ warnings.filterwarnings("ignore", category=UserWarning, module="langsmith")
 import argparse
 import random
 from utils import setup_logging
+import math
 
 
 from dotenv import load_dotenv
@@ -1862,22 +1863,59 @@ def track_llm_call(llm_func, llm_type, *args, **kwargs):
     llm_token_counts[llm_type].append((prompt_tokens, completion_tokens, total_tokens))
     return response
 
-def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, open_llm_model="mistralai/Mistral-Small-3.1-24B-Instruct-2503", open_llm_host="0.0.0.0", open_llm_port="8000", calculate_latency=False, use_quantization=True):
-    """Main CLI entry point."""
+def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, 
+         open_llm_model="mistralai/Mistral-Small-3.1-24B-Instruct-2503", 
+         open_llm_host="0.0.0.0", open_llm_port="8000", calculate_latency=False,
+         use_quantization=True, gpu_id=0, total_gpus=1, start_idx=None, end_idx=None):
+    """
+    Main CLI entry point.
+    
+    Parameters:
+    -----------
+    benchmark_name : str
+        Path to the benchmark file to process
+    human_in_the_loop : bool
+        Whether to involve humans in the processing loop
+    model_version : str
+        Version of the model to use
+    use_open_llm : bool
+        Whether to use open source LLM
+    open_llm_model : str
+        Name of the open source LLM model
+    open_llm_host : str
+        Host address for the LLM server
+    open_llm_port : str
+        Port for the LLM server
+    calculate_latency : bool
+        Whether to calculate and record latency
+    use_quantization : bool
+        Whether to use model quantization
+    gpu_id : int
+        ID of the current GPU (0 to total_gpus-1)
+    total_gpus : int
+        Total number of GPUs to distribute processing across
+    start_idx : int, optional
+        Start index for data splitting (overrides automatic calculation)
+    end_idx : int, optional
+        End index for data splitting (overrides automatic calculation)
+    """
     # Check CUDA availability and initialize
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is not available. This code requires a GPU to run.")
     
-    # Initialize primary CUDA device
+    # Initialize the CUDA device for this process
     torch.cuda.init()
-    torch.cuda.set_device(0)
+    current_device = gpu_id if gpu_id < torch.cuda.device_count() else 0
+    torch.cuda.set_device(current_device)
     
     # Print GPU info
-    gpu_name = torch.cuda.get_device_name(0)
-    gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
-    print(f"\nUsing GPU: {gpu_name}")
+    gpu_name = torch.cuda.get_device_name(current_device)
+    gpu_memory = torch.cuda.get_device_properties(current_device).total_memory / 1024**3
+    print(f"\nProcess running on GPU {current_device}: {gpu_name}")
     print(f"Available GPU memory: {gpu_memory:.2f} GB")
     print(f"Number of available GPUs: {torch.cuda.device_count()}")
+    print(f"Using {total_gpus} GPUs for distributed processing")
+    print(f"This is GPU {gpu_id} out of {total_gpus} total GPUs")
     # Declare globals
     global logger, config
     global llm_latencies, llm_token_counts
@@ -1938,9 +1976,28 @@ def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, o
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
 
-        # Load progress if exists
+        # Create GPU-specific save directory to keep logs separated
+        gpu_save_dir = os.path.join(save_dir, f"gpu_{gpu_id}")
+        if not os.path.exists(gpu_save_dir):
+            os.makedirs(gpu_save_dir)
+            
+        # First check for a GPU-specific progress file
+        gpu_progress_file = os.path.join(gpu_save_dir, f"progress_gpu_{gpu_id}.json")
         progress_file = os.path.join(save_dir, "progress.json")
-        if os.path.exists(progress_file):
+        
+        # Try to load GPU-specific progress first, fall back to general progress
+        if os.path.exists(gpu_progress_file):
+            with open(gpu_progress_file, "r") as file:
+                progress_data = json.load(file)
+                total_time = progress_data.get("total_time", 0)
+                # If we have GPU-specific data, prioritize it
+                if progress_data.get("gpu_id") == gpu_id:
+                    start_idx = progress_data.get("current_idx", 0)
+                    inference_times = progress_data.get("inference_times", [])
+                else:
+                    start_idx = 0
+                    inference_times = []
+        elif os.path.exists(progress_file):
             with open(progress_file, "r") as file:
                 progress_data = json.load(file)
                 total_time = progress_data.get("total_time", 0)
@@ -1978,10 +2035,31 @@ def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, o
         multi_turn_count = 0
         multi_turn_turns = []
         max_gpu_memories = []
-        # resume stats
-        stats_file = os.path.join(save_dir, "stats.json")
-        if os.path.exists(stats_file):
-            with open(stats_file, 'r') as f:
+        # First check for GPU-specific stats file
+        gpu_stats_file = os.path.join(gpu_save_dir, f"stats_gpu_{gpu_id}.json")
+        main_stats_file = os.path.join(save_dir, "stats.json")
+        
+        # Use GPU-specific stats if available, otherwise try main stats
+        if os.path.exists(gpu_stats_file):
+            with open(gpu_stats_file, 'r') as f:
+                stats = json.load(f)
+                
+            # Only use these stats if they're for the current GPU
+            if stats.get("gpu_id") == gpu_id:
+                single_turn_times = stats.get("single_turn_times", single_turn_times)
+                multi_turn_times = stats.get("multi_turn_times", multi_turn_times)
+                end2end_times = stats.get("end2end_times", end2end_times)
+                model_inference_times = stats.get("model_inference_times", model_inference_times)
+                llm_latencies = stats.get("llm_latencies", llm_latencies)
+                llm_token_counts = stats.get("llm_token_counts", llm_token_counts)
+                single_turn_count = stats.get("single_turn_count", single_turn_count)
+                multi_turn_count = stats.get("multi_turn_count", multi_turn_count)
+                multi_turn_turns = stats.get("multi_turn_turns", multi_turn_turns)
+                total_time = stats.get("total_time", total_time)
+                inference_times = stats.get("inference_times", inference_times)
+                max_gpu_memories = stats.get("max_gpu_memories", max_gpu_memories)
+        elif os.path.exists(main_stats_file):
+            with open(main_stats_file, 'r') as f:
                 stats = json.load(f)
             single_turn_times = stats.get("single_turn_times", single_turn_times)
             multi_turn_times = stats.get("multi_turn_times", multi_turn_times)
@@ -1996,15 +2074,51 @@ def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, o
             inference_times = stats.get("inference_times", inference_times)
             max_gpu_memories = stats.get("max_gpu_memories", max_gpu_memories)
             
+        # Set the stats file to be used for writing
+        stats_file = gpu_stats_file
+            
 
-        for idx, key in tqdm(enumerate(prompt_keys[start_idx:]), total=len(prompts) - start_idx):
+        # Calculate data splits for multi-GPU processing
+        total_items = len(prompt_keys)
+        print(f"Total items in dataset: {total_items}")
+        
+        # If start_idx and end_idx are provided, use them directly
+        if start_idx is not None and end_idx is not None:
+            processing_start_idx = start_idx
+            processing_end_idx = min(end_idx, total_items)
+            print(f"Using provided indices: processing items {processing_start_idx} to {processing_end_idx-1}")
+        else:
+            # Calculate the portion of data this GPU should process
+            items_per_gpu = math.ceil(total_items / total_gpus)
+            processing_start_idx = gpu_id * items_per_gpu
+            processing_end_idx = min(processing_start_idx + items_per_gpu, total_items)
+            print(f"GPU {gpu_id}: processing items {processing_start_idx} to {processing_end_idx-1} (total: {processing_end_idx - processing_start_idx})")
+        
+        # Adjust start_idx for resuming progress
+        resume_idx = max(start_idx if start_idx is not None else 0, processing_start_idx)
+            
+        # Get the subset of keys this GPU should process
+        gpu_prompt_keys = prompt_keys[processing_start_idx:processing_end_idx]
+        
+        # Adjust for resuming within the GPU's portion
+        gpu_start_idx = 0
+        if resume_idx > processing_start_idx:
+            gpu_start_idx = resume_idx - processing_start_idx
+            print(f"Resuming from item {resume_idx} (GPU-local index {gpu_start_idx})")
+        
+        for idx, key in tqdm(enumerate(gpu_prompt_keys[gpu_start_idx:]), 
+                            total=len(gpu_prompt_keys) - gpu_start_idx,
+                            desc=f"GPU {gpu_id} Processing"):
             # Initialize a fresh config for each prompt
             config = T2IConfig(human_in_loop=human_in_the_loop)
-            config.save_dir = save_dir
+            config.save_dir = gpu_save_dir
             config.use_open_llm = use_open_llm 
             config.open_llm_model = open_llm_model 
             config.open_llm_host = open_llm_host 
             config.open_llm_port = open_llm_port 
+            
+            # Calculate the global index for this item
+            global_idx = processing_start_idx + gpu_start_idx + idx
             
             # Handle different benchmark types consistently
             if "GenAIBenchmark" in str(benchmark_name):
@@ -2013,12 +2127,12 @@ def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, o
                 config.image_index = prompts[key]['id']
             else:  # DrawBench or other benchmarks
                 text_prompt = key
-                config.seed = seeds[idx + start_idx] if "seed" in str(benchmark_name) else torch.initial_seed()
-                config.image_index = f"{(idx+start_idx):03d}"
+                config.seed = seeds[global_idx] if "seed" in str(benchmark_name) else torch.initial_seed()
+                config.image_index = f"{global_idx:03d}"
                 print(f"Working on Benchmark name: {benchmark_name}")
 
             # Setup logging for this iteration
-            logger = setup_logging(save_dir, filename=f"{config.image_index}.log", console_output=False)
+            logger = setup_logging(gpu_save_dir, filename=f"{config.image_index}.log", console_output=False)
             config.logger = logger
 
             # start timing
@@ -2069,11 +2183,20 @@ def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, o
             # Save progress
             progress_data = {
                 "total_time": total_time,
-                "current_idx": idx + start_idx + 1,
-                "inference_times": inference_times
+                "current_idx": processing_start_idx + gpu_start_idx + idx + 1,
+                "inference_times": inference_times,
+                "gpu_id": gpu_id,
+                "start_idx": processing_start_idx,
+                "end_idx": processing_end_idx
             }
+            # Save progress in main file and GPU-specific file
             with open(progress_file, "w") as file:
-                json.dump(progress_data, file)  
+                json.dump(progress_data, file)
+                
+            # GPU-specific progress file
+            gpu_progress_file = os.path.join(gpu_save_dir, f"progress_gpu_{gpu_id}.json")
+            with open(gpu_progress_file, "w") as file:
+                json.dump(progress_data, file)
                 
             # Save stats.json
             stats = {
@@ -2088,9 +2211,21 @@ def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, o
                 "multi_turn_turns": multi_turn_turns,
                 "total_time": total_time,
                 "inference_times": inference_times,
-                "max_gpu_memories": max_gpu_memories
+                "max_gpu_memories": max_gpu_memories,
+                "gpu_id": gpu_id,
+                "total_gpus": total_gpus,
+                "start_idx": processing_start_idx,
+                "end_idx": processing_end_idx,
+                "completed_items": idx + 1,
+                "total_items_for_gpu": len(gpu_prompt_keys)
             }
+            # Save to GPU-specific stats file
             with open(stats_file, "w") as f:
+                json.dump(stats, f)
+                
+            # Also save a copy to the main directory for aggregation purposes
+            main_stats_file = os.path.join(save_dir, f"stats_gpu_{gpu_id}.json") 
+            with open(main_stats_file, "w") as f:
                 json.dump(stats, f)
         
         # Calculate and print average time
@@ -2145,34 +2280,22 @@ if __name__ == "__main__":
     parser.add_argument('--open_llm_host', default='0.0.0.0', type=str, help='Host address for the open LLM server')
     parser.add_argument('--open_llm_port', default='8000', type=str, help='Port for the open LLM server')
     parser.add_argument('--calculate_latency', action='store_true', help='Calculate and print latency statistics')
-    parser.add_argument('--part', type=int, default=0, help='Which part of the dataset to process (0-indexed)')
-    parser.add_argument('--total_parts', type=int, default=1, help='Total number of parts to split the dataset into')
+    # Multi-GPU arguments
+    parser.add_argument('--total_gpus', type=int, default=1, help='Total number of GPUs to distribute processing across')
+    parser.add_argument('--gpu_id', type=int, default=0, help='ID of the current GPU (0 to total_gpus-1)')
+    parser.add_argument('--start_idx', type=int, default=None, help='Start index for data splitting (overrides automatic calculation)')
+    parser.add_argument('--end_idx', type=int, default=None, help='End index for data splitting (overrides automatic calculation)')
 
     args = parser.parse_args()
-
-    # Patch: Split the dataset for multi-GPU
-    import json
-    def split_keys(keys, total_parts, part):
-        n = len(keys)
-        part_size = n // total_parts
-        remainder = n % total_parts
-        start = part * part_size + min(part, remainder)
-        end = start + part_size + (1 if part < remainder else 0)
-        return keys[start:end]
-
-    # Load the benchmark prompts
-    if args.benchmark_name.endswith('.json'):
-        with open(args.benchmark_name, 'r') as f:
-            prompts = json.load(f)
-        prompt_keys = list(prompts.keys())
-        # Split keys for this part
-        prompt_keys = split_keys(prompt_keys, args.total_parts, args.part)
-        # Save a temp file for this part
-        part_benchmark = f"part_{args.part}_of_{args.total_parts}.json"
-        with open(part_benchmark, 'w') as f:
-            json.dump({k: prompts[k] for k in prompt_keys}, f)
-        benchmark_name = part_benchmark
-    else:
-        benchmark_name = args.benchmark_name
-
-    main(benchmark_name, args.human_in_the_loop, args.model_version, args.use_open_llm, args.open_llm_model, args.open_llm_host, args.open_llm_port, args.calculate_latency)
+    
+    # Set the CUDA device for this process
+    if torch.cuda.is_available():
+        if args.gpu_id >= 0 and args.gpu_id < torch.cuda.device_count():
+            torch.cuda.set_device(args.gpu_id)
+            print(f"Set CUDA device to: {args.gpu_id}")
+        else:
+            print(f"Warning: Requested GPU {args.gpu_id} is out of range. Using default GPU.")
+    
+    main(args.benchmark_name, args.human_in_the_loop, args.model_version, args.use_open_llm, 
+         args.open_llm_model, args.open_llm_host, args.open_llm_port, args.calculate_latency, 
+         gpu_id=args.gpu_id, total_gpus=args.total_gpus, start_idx=args.start_idx, end_idx=args.end_idx)
