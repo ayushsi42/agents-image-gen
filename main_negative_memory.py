@@ -1,4 +1,5 @@
 import os
+import random
 from typing import List, Optional, Dict, Any, Union, Literal
 from enum import Enum
 
@@ -41,7 +42,8 @@ from transformers import Qwen2_5_VLForConditionalGeneration
 
 import re
 import json
-from prompts.system_prompts import make_intention_analysis_prompt, make_gen_image_judge_prompt
+from prompts.system_prompts_memory import make_intention_analysis_prompt, make_gen_image_judge_prompt
+from memory_modules import get_memory_manager, add_evaluation_to_memory
 
 import time
 from tqdm import tqdm
@@ -70,6 +72,10 @@ class T2IConfig:
         self.open_llm_model = ""  
         self.open_llm_host = ""  
         self.open_llm_port = ""  
+
+        # Memory system configuration
+        self.memory_db_path = "model_memories.db"
+        self.disable_memory = False
 
         # Prompt understanding configuration
         self.prompt_understanding = {
@@ -277,7 +283,6 @@ def initialize_llms(use_open_llm=False, open_llm_model="mistralai/Mistral-Small-
             response_format={"type": "json_object"}
         )
         print("Initialized GPT Instruct")
-    
     return llm, llm_json
 
 class IntentionAnalyzer:
@@ -887,11 +892,10 @@ def generate_with_qwen_image(prompt: str, negative_prompt: str, seed: int) -> st
             torch.cuda.empty_cache()
 
         # Ensure we're on the right device
+        print("Seed: ",seed)
         generator = torch.Generator("cuda").manual_seed(seed)
         
         with torch.inference_mode():
-            negative_prompt_ = "blucolors, overexposedrred details, subtitles, overall gray, worst quality, low quality, JPEG compression residue, ugly, mutilated, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, malformed limbs, fused fingers, still image, cluttered background, three legs"
-            negative_prompt = negative_prompt_ + negative_prompt
             # Use native negative prompt support
             # print("Negative Prompt: ",negative_prompt)
             # print("Positive Prompt: ",prompt)
@@ -969,6 +973,7 @@ def generate_with_qwen_edit(prompt: str, negative_prompt: str, existing_image_di
             raise ValueError(f"Failed to load input image from {existing_image_dir}: {str(e)}")
         
         # Ensure we're on the right device
+        print("Seed: ",seed)
         generator = torch.Generator("cuda").manual_seed(seed)
         
         with torch.inference_mode():
@@ -1337,8 +1342,8 @@ def intention_understanding_node(state: MessagesState) -> Command[str]:
     logger.info("-"*50)
     logger.info("INSIDE INTENTION UNDERSTANDING NODE")
     logger.info(f"Processing message: {last_message.content}")
-    logger.info(f"Message count: {len(state["messages"])}")
-    logger.info(f"Overall messages: {state["messages"]}")
+    logger.info(f"Message count: {len(state['messages'])}")
+    logger.info(f"Overall messages: {state['messages']}")
     logger.info(f"Current config: {config.to_dict()}")
 
     # First interaction - analyze the prompt
@@ -1435,7 +1440,7 @@ def intention_understanding_node(state: MessagesState) -> Command[str]:
                             config.prompt_understanding["creativity_level"] = CreativityLevel.MEDIUM
                         elif "HIGH" in refinement_result['suggested_creativity_level']:
                             config.prompt_understanding["creativity_level"] = CreativityLevel.HIGH
-                        logger.info(f"Update creativity level to {config.prompt_understanding["creativity_level"]}")
+                        logger.info(f"Update creativity level to {config.prompt_understanding['creativity_level']}")
                     
                     logger.info(f"Final refinement result: {json.dumps(refinement_result, indent=2)}")
                     
@@ -1690,10 +1695,39 @@ def evaluation_node(state: MessagesState) -> Command[str]:
         evaluation_result = track_llm_call(llm_json.invoke, "evaluation", evaluation_prompt)
         evaluation_data = json.loads(evaluation_result.content)
 
-        # Update config with evaluation score
+        # Update config with evaluation score and additional fields
         current_config["evaluation_score"] = evaluation_data["overall_score"]
         current_config["improvement_suggestions"] = evaluation_data["improvement_suggestions"]
+        
+        # Store additional evaluation details for better analysis
+        current_config["aesthetic_reasoning"] = evaluation_data.get("aesthetic_reasoning", "")
+        current_config["alignment_reasoning"] = evaluation_data.get("alignment_reasoning", "")
+        current_config["overall_reasoning"] = evaluation_data.get("overall_reasoning", "")
+        current_config["detected_artifacts"] = evaluation_data.get("artifacts", {}).get("detected_artifacts", [])
+        current_config["artifact_reasoning"] = evaluation_data.get("artifacts", {}).get("artifact_reasoning", "")
+        current_config["main_subjects_present"] = evaluation_data.get("main_subjects_present", True)
+        current_config["missing_elements"] = evaluation_data.get("missing_elements", [])
+        
         logger.info(f"Evaluation result: {json.dumps(evaluation_data, indent=2)}")
+        
+        # Add evaluation to memory system
+        if not config.disable_memory:
+            try:
+                model_name = current_config.get("selected_model", "Unknown")
+                session_id = f"{config.image_index or 0}_{int(datetime.now().timestamp())}"
+                
+                # Initialize memory manager with custom database path if needed
+                if config.memory_db_path != "model_memories.db":
+                    from memory_modules import MemoryManager
+                    global memory_manager
+                    memory_manager = MemoryManager(config.memory_db_path)
+                
+                add_evaluation_to_memory(model_name, config, session_id)
+                logger.info(f"Added evaluation to {model_name} memory")
+            except Exception as e:
+                logger.error(f"Failed to add evaluation to memory: {e}")
+        else:
+            logger.debug("Memory system disabled")
         
         # Define threshold for acceptable quality
         QUALITY_THRESHOLD = 8.0
@@ -1707,16 +1741,32 @@ def evaluation_node(state: MessagesState) -> Command[str]:
         if config.is_human_in_loop:
             
             logger.info("Human-in-loop is enabled, requesting user feedback.")
-            print("\nCurrent evaluation score:", current_config['evaluation_score'])
-            print("Evaluation feedback:", current_config['improvement_suggestions'])
+            print("\n" + "="*50)
+            print("EVALUATION RESULTS")
+            print("="*50)
+            print(f"Overall Score: {current_config['evaluation_score']}/10.0")
+            print(f"Main Subjects Present: {current_config.get('main_subjects_present', 'Unknown')}")
+            
+            if current_config.get('missing_elements'):
+                print(f"Missing Elements: {', '.join(current_config['missing_elements'])}")
+            
+            if current_config.get('detected_artifacts'):
+                print(f"Detected Artifacts: {', '.join(current_config['detected_artifacts'])}")
+            
+            print(f"\nAesthetic Reasoning: {current_config.get('aesthetic_reasoning', 'Not available')}")
+            print(f"Alignment Reasoning: {current_config.get('alignment_reasoning', 'Not available')}")
+            print(f"Overall Reasoning: {current_config.get('overall_reasoning', 'Not available')}")
+            print(f"\nImprovement Suggestions: {current_config['improvement_suggestions']}")
+            print("="*50)
             # TODO: visualize the image for user to evalute
             
             feedback_type = input("\nWould you like to provide feedback?\n0. I like the image and no need to regenerate\n1. Provide text suggestions\n2. Skip feedback but want regenerate the image\nEnter choice (0-2): ")
             if feedback_type == "0":
                 logger.info("User likes the image, no need to regenerate.")
                 final_message = (
-                    f"Final image generated with score: {current_config['evaluation_score']}\n"
-                    f"Detailed feedback: {current_config['improvement_suggestions']}\n"
+                    f"Final image generated with score: {current_config['evaluation_score']}/10.0\n"
+                    f"Overall reasoning: {current_config.get('overall_reasoning', 'Not available')}\n"
+                    f"Improvement suggestions: {current_config['improvement_suggestions']}\n"
                     f"User feedback: User likes the image, no need to regenerate."
                 )
                 comment = Command(
@@ -1766,8 +1816,9 @@ def evaluation_node(state: MessagesState) -> Command[str]:
         
         # If quality is acceptable or max attempts reached
         final_message = (
-            f"Final image generated with score: {current_config['evaluation_score']}\n"
-            f"Detailed feedback: {current_config['improvement_suggestions']}"
+            f"Final image generated with score: {current_config['evaluation_score']}/10.0\n"
+            f"Overall reasoning: {current_config.get('overall_reasoning', 'Not available')}\n"
+            f"Improvement suggestions: {current_config['improvement_suggestions']}"
         )
         
         if config.regeneration_count >= MAX_REGENERATION_ATTEMPTS and not config.is_human_in_loop:
@@ -1864,7 +1915,7 @@ def track_llm_call(llm_func, llm_type, *args, **kwargs):
     llm_token_counts[llm_type].append((prompt_tokens, completion_tokens, total_tokens))
     return response
 
-def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, open_llm_model="mistralai/Mistral-Small-3.1-24B-Instruct-2503", open_llm_host="0.0.0.0", open_llm_port="8000", calculate_latency=False, use_quantization=True):
+def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, open_llm_model="mistralai/Mistral-Small-3.1-24B-Instruct-2503", open_llm_host="0.0.0.0", open_llm_port="8000", calculate_latency=False, memory_db_path="model_memories.db", disable_memory=False, use_quantization=True):
     """Main CLI entry point."""
     # Check CUDA availability and initialize
     if not torch.cuda.is_available():
@@ -1936,28 +1987,13 @@ def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, o
             model_name = open_llm_model.split('/')[-1]
             model_suffix += f"_open_llm_{model_name}"
         
-        # Extract part number from benchmark_name for GPU-specific directories
-        part_number = None
-        if "part_" in str(benchmark_name):
-            import re
-            match = re.search(r'part_(\d+)', str(benchmark_name))
-            if match:
-                part_number = match.group(1)
-        
-        # Create GPU-specific directory structure
-        base_dir_name = f"AgentSys_{model_suffix}_human_in_loop" if human_in_the_loop else f"AgentSys_{model_suffix}"
-        
-        if part_number:
-            # For parallel GPU runs, create part-specific subdirectories
-            save_dir = os.path.join("results", bench_result_folder, base_dir_name, f"part_{part_number}")
-            print(f"Using GPU-specific results directory: {save_dir}")
+        if human_in_the_loop:
+            save_dir = os.path.join("results", bench_result_folder, f"AgentSys_{model_suffix}_human_in_loop")
         else:
-            # For single runs or complete datasets
-            save_dir = os.path.join("results", bench_result_folder, base_dir_name)
+            save_dir = os.path.join("results", bench_result_folder, f"AgentSys_{model_suffix}")
         
         if not os.path.exists(save_dir):
-            os.makedirs(save_dir, exist_ok=True)
-            print(f"Created results directory: {save_dir}")
+            os.makedirs(save_dir)
 
         # Load progress if exists
         progress_file = os.path.join(save_dir, "progress.json")
@@ -2018,10 +2054,7 @@ def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, o
             max_gpu_memories = stats.get("max_gpu_memories", max_gpu_memories)
             
 
-        for idx, key in tqdm(enumerate(prompt_keys[start_idx:]), total=len(prompt_keys) - start_idx, desc=f"Processing {benchmark_name}"):
-            # Calculate actual index
-            actual_idx = idx + start_idx
-            
+        for idx, key in tqdm(enumerate(prompt_keys[start_idx:]), total=len(prompts) - start_idx):
             # Initialize a fresh config for each prompt
             config = T2IConfig(human_in_loop=human_in_the_loop)
             config.save_dir = save_dir
@@ -2029,17 +2062,18 @@ def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, o
             config.open_llm_model = open_llm_model 
             config.open_llm_host = open_llm_host 
             config.open_llm_port = open_llm_port 
+            config.memory_db_path = memory_db_path
+            config.disable_memory = disable_memory 
             
             # Handle different benchmark types consistently
             if "GenAIBenchmark" in str(benchmark_name):
                 text_prompt = prompts[key]['prompt'] 
-                # Always use the random_seed from the JSON file if available
-                config.seed = prompts[key].get("random_seed", torch.initial_seed())
+                config.seed = prompts[key].get("random_seed") if "seed" in str(benchmark_name) else torch.initial_seed()
                 config.image_index = prompts[key]['id']
             else:  # DrawBench or other benchmarks
                 text_prompt = key
-                config.seed = seeds[actual_idx] if "seed" in str(benchmark_name) and 'seeds' in locals() else torch.initial_seed()
-                config.image_index = f"{actual_idx:05d}"
+                config.seed = seeds[idx + start_idx] if "seed" in str(benchmark_name) else torch.initial_seed()
+                config.image_index = f"{(idx+start_idx):03d}"
                 print(f"Working on Benchmark name: {benchmark_name}")
 
             # Setup logging for this iteration
@@ -2048,41 +2082,24 @@ def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, o
 
             # start timing
             torch.cuda.reset_peak_memory_stats(0)
+            # torch.cuda.reset_peak_memory_stats(1)
             start_time = time.time()
 
             logger.info("\n" + "="*83)
             logger.info(f"New Session Started for index {config.image_index}: {datetime.now()}")
-            logger.info(f"Processing prompt: {text_prompt}")
-            logger.info(f"Using seed: {config.seed}")
-            logger.info(f"Results will be saved to: {save_dir}")
-            logger.info("="*83)
+            logger.info("="*50)
 
-            try:
-                logger.info(f"Starting workflow with prompt: {text_prompt}, seed: {config.seed}")
-                result = run_workflow(workflow, text_prompt)
+            logger.info(f"Starting workflow with prompt: {text_prompt}, seed: {config.seed}")
+            result = run_workflow(workflow, text_prompt)
 
-                # Save config state after generation
-                config_save_path = os.path.join(save_dir, f"{config.image_index}_config.json")
-                config.save_to_file(config_save_path)
-                logger.info(f"Saved config state to: {config_save_path}")
-                
-                # Log the generated image path if available
-                current_config = config.get_current_config()
-                if current_config.get("gen_image_path"):
-                    logger.info(f"Generated image saved to: {current_config['gen_image_path']}")
-                    print(f"✅ Image {config.image_index} saved: {current_config['gen_image_path']}")
-                else:
-                    logger.warning(f"No image path found for {config.image_index}")
-                    
-            except Exception as e:
-                logger.error(f"Error processing prompt {config.image_index}: {str(e)}")
-                print(f"❌ Error processing image {config.image_index}: {str(e)}")
-                continue
+            # Save config state after generation
+            config_save_path = os.path.join(save_dir, f"{config.image_index}_config.json")
+            config.save_to_file(config_save_path)
+            logger.info(f"Saved config state to: {config_save_path}")
             # End timing & record stats
             end_time = time.time()
             inference_time = end_time - start_time
             end2end_times.append(inference_time)
-            
             # Determine single/multi-turn
             if config.regeneration_count == 0:
                 single_turn_times.append(inference_time)
@@ -2104,21 +2121,20 @@ def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, o
                 logger.warning(f"Could not collect GPU memory stats: {e}")
                 max_gpu_memories.append(0)
                 
-            logger.info(f"Inference time for prompt {config.image_index}: {inference_time:.4f} seconds")
-            logger.info("Workflow completed")
+            logger.info(f"Inference time for prompt {key}: {inference_time:.4f} seconds")
 
-            # Save progress after each successful completion
+            logger.info("Workflow completed")    
+
+            # Save progress
             progress_data = {
                 "total_time": total_time,
-                "current_idx": actual_idx + 1,
-                "inference_times": inference_times,
-                "completed_prompts": actual_idx + 1,
-                "total_prompts": len(prompt_keys)
+                "current_idx": idx + start_idx + 1,
+                "inference_times": inference_times
             }
             with open(progress_file, "w") as file:
-                json.dump(progress_data, file, indent=2)  
+                json.dump(progress_data, file)  
                 
-            # Save stats.json after each completion
+            # Save stats.json
             stats = {
                 "single_turn_times": single_turn_times,
                 "multi_turn_times": multi_turn_times,
@@ -2131,14 +2147,10 @@ def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, o
                 "multi_turn_turns": multi_turn_turns,
                 "total_time": total_time,
                 "inference_times": inference_times,
-                "max_gpu_memories": max_gpu_memories,
-                "benchmark_name": benchmark_name,
-                "part_number": part_number if part_number else "complete"
+                "max_gpu_memories": max_gpu_memories
             }
             with open(stats_file, "w") as f:
-                json.dump(stats, f, indent=2)
-                
-            print(f"Progress: {actual_idx + 1}/{len(prompt_keys)} completed. Time: {inference_time:.2f}s")
+                json.dump(stats, f)
         
         # Calculate and print average time
         # avg_time = total_time / progress_data["current_idx"]
@@ -2179,6 +2191,34 @@ def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, o
                 print(f"GPU max memory usage: {max(max_gpu_memories):.2f} GB / {total_gpu_memory:.2f} GB")
             else:
                 print("GPU max memory usage: 0.00 GB (fail to log)")
+        
+        # Display memory statistics at the end
+        if not disable_memory:
+            try:
+                manager = get_memory_manager(memory_db_path)
+                memory_summary = manager.get_memory_summary()
+                
+                print("\n==== Memory Statistics ====")
+                for model_name, stats in memory_summary.items():
+                    if stats['total_evaluations'] > 0:
+                        print(f"\n{model_name}:")
+                        print(f"  Total evaluations: {stats['total_evaluations']}")
+                        print(f"  Average score: {stats['average_score']:.2f}")
+                        print(f"  Score range: {stats['min_score']:.1f} - {stats['max_score']:.1f}")
+                        print(f"  Recent average (last 10): {stats['recent_average']:.2f}")
+                        print(f"  Unique sessions: {stats['unique_sessions']}")
+                        
+                        if stats['score_distribution']:
+                            print(f"  Score distribution: {stats['score_distribution']}")
+                    else:
+                        print(f"\n{model_name}: No evaluations recorded")
+                        
+            except Exception as e:
+                print(f"\nMemory statistics unavailable: {e}")
+        else:
+            print("\n==== Memory System Disabled ====")
+            print("  Use --memory_db_path to specify database location")
+            print("  Remove --disable_memory flag to enable memory system")
 
 
 if __name__ == "__main__":
@@ -2192,6 +2232,8 @@ if __name__ == "__main__":
     parser.add_argument('--open_llm_host', default='0.0.0.0', type=str, help='Host address for the open LLM server')
     parser.add_argument('--open_llm_port', default='8000', type=str, help='Port for the open LLM server')
     parser.add_argument('--calculate_latency', action='store_true', help='Calculate and print latency statistics')
+    parser.add_argument('--memory_db_path', default='model_memories.db', type=str, help='Path to the memory database file')
+    parser.add_argument('--disable_memory', action='store_true', help='Disable memory system (for testing or reduced overhead)')
 
     args = parser.parse_args()
-    main(args.benchmark_name, args.human_in_the_loop, args.model_version, args.use_open_llm, args.open_llm_model, args.open_llm_host, args.open_llm_port, args.calculate_latency)
+    main(args.benchmark_name, args.human_in_the_loop, args.model_version, args.use_open_llm, args.open_llm_model, args.open_llm_host, args.open_llm_port, args.calculate_latency, args.memory_db_path, args.disable_memory)

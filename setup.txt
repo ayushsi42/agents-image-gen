@@ -13,6 +13,7 @@ gh auth login
 git clone https://github.com/ayushsi42/agents-image-gen.git
 cd agents-image-gen
 conda env create -f environment.yaml
+conda activate t2i_copilot
 pip install git+https://github.com/huggingface/diffusers
 pip install --upgrade "transformers>=4.44.0"
 pip install bitsandbytes

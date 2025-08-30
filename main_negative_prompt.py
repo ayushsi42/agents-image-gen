@@ -268,16 +268,15 @@ def initialize_llms(use_open_llm=False, open_llm_model="mistralai/Mistral-Small-
     else:
         # Using Qwen-2.5
         llm = ChatOpenAI(
-            model="qwen/qwen2.5-vl-72b-instruct",
+            model="openai/gpt-4o-mini",
             openai_api_base="https://openrouter.ai/api/v1"
         )
         llm_json = ChatOpenAI(
-            model="qwen/qwen2.5-vl-72b-instruct",
+            model="openai/gpt-4o-mini",
             openai_api_base="https://openrouter.ai/api/v1",
             response_format={"type": "json_object"}
         )
-        print("Initialized Qwen-32B-VL Instruct")
-    
+        print("Initialized GPT Instruct")
     return llm, llm_json
 
 class IntentionAnalyzer:
@@ -887,6 +886,7 @@ def generate_with_qwen_image(prompt: str, negative_prompt: str, seed: int) -> st
             torch.cuda.empty_cache()
 
         # Ensure we're on the right device
+        print("Seed: ",seed)
         generator = torch.Generator("cuda").manual_seed(seed)
         
         with torch.inference_mode():
@@ -967,6 +967,7 @@ def generate_with_qwen_edit(prompt: str, negative_prompt: str, existing_image_di
             raise ValueError(f"Failed to load input image from {existing_image_dir}: {str(e)}")
         
         # Ensure we're on the right device
+        print("Seed: ",seed)
         generator = torch.Generator("cuda").manual_seed(seed)
         
         with torch.inference_mode():
@@ -1917,11 +1918,15 @@ def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, o
                 prompt_keys = list(prompts.keys())
                 bench_result_folder = 'GenAIBenchmark-fixseed'
             else:
-                lines = [line.strip().split('\t') for line in file]
-                prompts = [line[0] for line in lines]
-                seeds = [int(line[1]) for line in lines]
-                prompt_keys = prompts
-                bench_result_folder = os.path.basename(benchmark_dir)
+                prompts = json.load(file)
+                prompt_keys = list(prompts.keys())
+                bench_result_folder = "123"
+            # else:
+            #     lines = [line.strip().split('\t') for line in file]
+            #     prompts = [line[0] for line in lines]
+            #     seeds = [int(line[1]) for line in lines]
+            #     prompt_keys = prompts
+            #     bench_result_folder = os.path.basename(benchmark_dir)
 
         # Create model type suffix for directory
         model_suffix = model_version
