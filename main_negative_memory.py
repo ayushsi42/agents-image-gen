@@ -1,7 +1,10 @@
 import os
-import random
 from typing import List, Optional, Dict, Any, Union, Literal
 from enum import Enum
+import sqlite3
+import json
+import os
+import time
 
 # Node names
 NODE_MODEL_SELECTION = "model_selection"
@@ -42,8 +45,7 @@ from transformers import Qwen2_5_VLForConditionalGeneration
 
 import re
 import json
-from prompts.system_prompts_memory import make_intention_analysis_prompt, make_gen_image_judge_prompt
-from memory_modules import get_memory_manager, add_evaluation_to_memory
+from prompts.system_prompts import make_intention_analysis_prompt, make_gen_image_judge_prompt
 
 import time
 from tqdm import tqdm
@@ -72,10 +74,6 @@ class T2IConfig:
         self.open_llm_model = ""  
         self.open_llm_host = ""  
         self.open_llm_port = ""  
-
-        # Memory system configuration
-        self.memory_db_path = "model_memories.db"
-        self.disable_memory = False
 
         # Prompt understanding configuration
         self.prompt_understanding = {
@@ -732,6 +730,358 @@ Consider the scene type, style, and content to determine what should be avoided.
                 "negative_prompt": "low quality, blurry, distorted, watermark, text, bad anatomy",
                 "reasoning": "Fallback generic negative prompt due to generation error"
             }
+
+
+class MemoryManager:
+    """Manages global memory for model performance analysis using SQLite."""
+    
+    def __init__(self, db_path: str = "model_memory.db"):
+        self.db_path = db_path
+        self.logger = logger
+        self._init_database()
+    
+    def _init_database(self):
+        """Initialize SQLite database with tables for each model."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # Table for Qwen-Image memory
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS qwen_image_memory (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    image_index TEXT,
+                    original_prompt TEXT,
+                    refined_prompt TEXT,
+                    evaluation_score REAL,
+                    confidence_score REAL,
+                    regeneration_count INTEGER,
+                    good_things TEXT,
+                    bad_things TEXT,
+                    config_data TEXT,
+                    process_summary TEXT
+                )
+            ''')
+            
+            # Table for Qwen-Image-Edit memory
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS qwen_image_edit_memory (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    image_index TEXT,
+                    original_prompt TEXT,
+                    refined_prompt TEXT,
+                    evaluation_score REAL,
+                    confidence_score REAL,
+                    regeneration_count INTEGER,
+                    reference_image TEXT,
+                    good_things TEXT,
+                    bad_things TEXT,
+                    config_data TEXT,
+                    process_summary TEXT
+                )
+            ''')
+            
+            conn.commit()
+            conn.close()
+            self.logger.debug(f"Initialized memory database at: {self.db_path}")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to initialize memory database: {str(e)}")
+    
+    def _generate_process_summary(self, config_data: Dict[str, Any]) -> str:
+        """Generate a comprehensive summary of the entire workflow process."""
+        try:
+            summary_parts = []
+            
+            # Process overview
+            summary_parts.append("=== IMAGE GENERATION WORKFLOW SUMMARY ===")
+            
+            # Initial prompt understanding
+            prompt_understanding = config_data.get("prompt_understanding", {})
+            summary_parts.append(f"\n1. PROMPT UNDERSTANDING:")
+            summary_parts.append(f"   - Original Prompt: {prompt_understanding.get('original_prompt', 'N/A')}")
+            summary_parts.append(f"   - Creativity Level: {prompt_understanding.get('creativity_level', 'N/A')}")
+            summary_parts.append(f"   - Refined Prompt: {prompt_understanding.get('refined_prompt', 'N/A')}")
+            
+            # Analysis details
+            if prompt_understanding.get('prompt_analysis'):
+                analysis = prompt_understanding['prompt_analysis']
+                if isinstance(analysis, str):
+                    try:
+                        analysis = json.loads(analysis)
+                    except:
+                        pass
+                if isinstance(analysis, dict):
+                    summary_parts.append(f"   - Identified Elements: {analysis.get('identified_elements', {})}")
+                    summary_parts.append(f"   - Ambiguous Elements: {len(analysis.get('ambiguous_elements', []))} items")
+            
+            # Regeneration attempts
+            regen_configs = config_data.get("regeneration_configs", {})
+            regen_count = config_data.get("regeneration_count", 0)
+            summary_parts.append(f"\n2. GENERATION ATTEMPTS: {regen_count + 1} total")
+            
+            for i in range(regen_count + 1):
+                config_key = f"count_{i}"
+                if config_key in regen_configs:
+                    regen_config = regen_configs[config_key]
+                    attempt_num = i + 1
+                    summary_parts.append(f"\n   Attempt {attempt_num}:")
+                    summary_parts.append(f"   - Selected Model: {regen_config.get('selected_model', 'N/A')}")
+                    summary_parts.append(f"   - Model Selection Reasoning: {regen_config.get('reasoning', 'N/A')}")
+                    summary_parts.append(f"   - Confidence Score: {regen_config.get('confidence_score', 'N/A')}")
+                    summary_parts.append(f"   - Generating Prompt: {regen_config.get('generating_prompt', 'N/A')}")
+                    summary_parts.append(f"   - Negative Prompt: {regen_config.get('negative_prompt', 'N/A')}")
+                    summary_parts.append(f"   - Evaluation Score: {regen_config.get('evaluation_score', 'N/A')}")
+                    summary_parts.append(f"   - Generated Image: {regen_config.get('gen_image_path', 'N/A')}")
+                    if regen_config.get('reference_content_image'):
+                        summary_parts.append(f"   - Reference Image: {regen_config.get('reference_content_image', 'N/A')}")
+                    if regen_config.get('improvement_suggestions'):
+                        summary_parts.append(f"   - Improvement Suggestions: {regen_config.get('improvement_suggestions', 'N/A')}")
+            
+            # Configuration details
+            summary_parts.append(f"\n3. SYSTEM CONFIGURATION:")
+            summary_parts.append(f"   - Human in Loop: {config_data.get('is_human_in_loop', 'N/A')}")
+            summary_parts.append(f"   - Seed: {config_data.get('seed', 'N/A')}")
+            summary_parts.append(f"   - Open LLM Used: {config_data.get('use_open_llm', 'N/A')}")
+            if config_data.get('use_open_llm'):
+                summary_parts.append(f"   - LLM Model: {config_data.get('open_llm_model', 'N/A')}")
+            
+            return "\n".join(summary_parts)
+            
+        except Exception as e:
+            self.logger.error(f"Failed to generate process summary: {str(e)}")
+            return f"Error generating summary: {str(e)}"
+    
+    def _analyze_model_performance(self, config_data: Dict[str, Any], process_summary: str, model_name: str) -> Dict[str, str]:
+        """Use LLM to analyze model performance and extract good/bad things."""
+        try:
+            analysis_prompt = f"""You are an expert AI model performance analyst. Analyze the following image generation workflow and extract insights about the {model_name} model's performance.
+
+WORKFLOW SUMMARY:
+{process_summary}
+
+DETAILED CONFIG DATA:
+{json.dumps(config_data, indent=2)}
+
+Please analyze this specific model's performance considering:
+1. Model Selection Reasoning: Why was this model chosen? Was it appropriate?
+2. Confidence Scores: How confident was the system in the model choice?
+3. Evaluation Scores: How well did the model perform according to automated evaluation?
+4. Prompt Handling: How well did the model handle the given prompt complexity?
+5. Reference Image Usage: (For Qwen-Image-Edit) How well did it utilize reference images?
+6. Generation Quality: Based on evaluation scores and feedback
+7. Efficiency: Time taken, resource usage if available
+
+Extract and categorize insights into good and bad aspects. Be specific and actionable.
+
+Return a JSON response with:
+{{
+    "good_things": "Detailed description of what the model did well, specific strengths observed, successful aspects of the generation process",
+    "bad_things": "Detailed description of issues, weaknesses, areas for improvement, specific problems encountered"
+}}
+
+Focus on actionable insights that could help improve future model selection and parameter tuning."""
+
+            response = track_llm_call(llm_json.invoke, "model_performance_analysis", [
+                ("system", "You are an expert AI model performance analyst."),
+                ("human", analysis_prompt)
+            ])
+            
+            if isinstance(response.content, str):
+                result = json.loads(response.content)
+            elif isinstance(response.content, dict):
+                result = response.content
+            else:
+                raise ValueError(f"Unexpected response type: {type(response.content)}")
+            
+            self.logger.debug(f"Model analysis for {model_name}: {result}")
+            return result
+            
+        except Exception as e:
+            self.logger.error(f"Failed to analyze model performance for {model_name}: {str(e)}")
+            return {
+                "good_things": f"Analysis failed: {str(e)}",
+                "bad_things": f"Analysis failed: {str(e)}"
+            }
+    
+    def save_model_memory(self, config_data: Dict[str, Any]):
+        """Save model performance analysis to memory database."""
+        try:
+            # Generate process summary
+            process_summary = self._generate_process_summary(config_data)
+            
+            # Get regeneration configs to determine which models were used
+            regen_configs = config_data.get("regeneration_configs", {})
+            regen_count = config_data.get("regeneration_count", 0)
+            
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            timestamp = datetime.now().isoformat()
+            
+            # Process each regeneration attempt
+            for i in range(regen_count + 1):
+                config_key = f"count_{i}"
+                if config_key not in regen_configs:
+                    continue
+                    
+                regen_config = regen_configs[config_key]
+                model_name = regen_config.get('selected_model', '')
+                
+                if not model_name:
+                    continue
+                
+                # Analyze model performance
+                analysis = self._analyze_model_performance(config_data, process_summary, model_name)
+                
+                # Prepare common data
+                common_data = {
+                    'timestamp': timestamp,
+                    'image_index': str(config_data.get('image_index', '')),
+                    'original_prompt': config_data.get('prompt_understanding', {}).get('original_prompt', ''),
+                    'refined_prompt': config_data.get('prompt_understanding', {}).get('refined_prompt', ''),
+                    'evaluation_score': regen_config.get('evaluation_score', 0.0),
+                    'confidence_score': regen_config.get('confidence_score', 0.0),
+                    'regeneration_count': i,
+                    'good_things': analysis.get('good_things', ''),
+                    'bad_things': analysis.get('bad_things', ''),
+                    'config_data': json.dumps(config_data),
+                    'process_summary': process_summary
+                }
+                
+                if model_name == "Qwen-Image":
+                    cursor.execute('''
+                        INSERT INTO qwen_image_memory 
+                        (timestamp, image_index, original_prompt, refined_prompt, evaluation_score, 
+                         confidence_score, regeneration_count, good_things, bad_things, config_data, process_summary)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        common_data['timestamp'], common_data['image_index'], common_data['original_prompt'],
+                        common_data['refined_prompt'], common_data['evaluation_score'], common_data['confidence_score'],
+                        common_data['regeneration_count'], common_data['good_things'], common_data['bad_things'],
+                        common_data['config_data'], common_data['process_summary']
+                    ))
+                    self.logger.info(f"Saved Qwen-Image memory for attempt {i+1}")
+                    
+                elif model_name == "Qwen-Image-Edit":
+                    # Only save Qwen-Image-Edit memory if there was regeneration (i > 0)
+                    if i > 0:
+                        cursor.execute('''
+                            INSERT INTO qwen_image_edit_memory 
+                            (timestamp, image_index, original_prompt, refined_prompt, evaluation_score, 
+                             confidence_score, regeneration_count, reference_image, good_things, bad_things, 
+                             config_data, process_summary)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ''', (
+                            common_data['timestamp'], common_data['image_index'], common_data['original_prompt'],
+                            common_data['refined_prompt'], common_data['evaluation_score'], common_data['confidence_score'],
+                            common_data['regeneration_count'], regen_config.get('reference_content_image', ''),
+                            common_data['good_things'], common_data['bad_things'],
+                            common_data['config_data'], common_data['process_summary']
+                        ))
+                        self.logger.info(f"Saved Qwen-Image-Edit memory for regeneration attempt {i+1}")
+            
+            conn.commit()
+            conn.close()
+            self.logger.info(f"Successfully saved model memory to database: {self.db_path}")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to save model memory: {str(e)}")
+    
+    def get_model_memory_summary(self, model_name: str, limit: int = 10) -> List[Dict]:
+        """Retrieve recent memory entries for a specific model."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            table_name = "qwen_image_memory" if model_name == "Qwen-Image" else "qwen_image_edit_memory"
+            
+            cursor.execute(f'''
+                SELECT timestamp, image_index, original_prompt, evaluation_score, 
+                       confidence_score, good_things, bad_things
+                FROM {table_name}
+                ORDER BY timestamp DESC
+                LIMIT ?
+            ''', (limit,))
+            
+            results = cursor.fetchall()
+            conn.close()
+            
+            columns = ['timestamp', 'image_index', 'original_prompt', 'evaluation_score', 
+                      'confidence_score', 'good_things', 'bad_things']
+            
+            return [dict(zip(columns, row)) for row in results]
+            
+        except Exception as e:
+            self.logger.error(f"Failed to retrieve memory for {model_name}: {str(e)}")
+            return []
+
+
+def view_memory_database(db_path: str = "model_memory.db"):
+    """Utility function to view contents of the memory database."""
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        
+        print(f"\n=== Memory Database Contents: {db_path} ===")
+        
+        # Check Qwen-Image memory
+        cursor.execute("SELECT COUNT(*) FROM qwen_image_memory")
+        qwen_image_count = cursor.fetchone()[0]
+        print(f"\nQwen-Image Memory Entries: {qwen_image_count}")
+        
+        if qwen_image_count > 0:
+            cursor.execute('''
+                SELECT timestamp, image_index, original_prompt, evaluation_score, 
+                       confidence_score, regeneration_count, good_things, bad_things
+                FROM qwen_image_memory 
+                ORDER BY timestamp DESC 
+                LIMIT 3
+            ''')
+            results = cursor.fetchall()
+            for i, row in enumerate(results):
+                print(f"\n  Entry {i+1}:")
+                print(f"    Timestamp: {row[0]}")
+                print(f"    Image Index: {row[1]}")
+                print(f"    Original Prompt: {row[2][:100]}...")
+                print(f"    Evaluation Score: {row[3]}")
+                print(f"    Confidence Score: {row[4]}")
+                print(f"    Regeneration Count: {row[5]}")
+                print(f"    Good Things: {row[6][:100]}...")
+                print(f"    Bad Things: {row[7][:100]}...")
+        
+        # Check Qwen-Image-Edit memory
+        cursor.execute("SELECT COUNT(*) FROM qwen_image_edit_memory")
+        qwen_edit_count = cursor.fetchone()[0]
+        print(f"\nQwen-Image-Edit Memory Entries: {qwen_edit_count}")
+        
+        if qwen_edit_count > 0:
+            cursor.execute('''
+                SELECT timestamp, image_index, original_prompt, evaluation_score, 
+                       confidence_score, regeneration_count, reference_image, good_things, bad_things
+                FROM qwen_image_edit_memory 
+                ORDER BY timestamp DESC 
+                LIMIT 3
+            ''')
+            results = cursor.fetchall()
+            for i, row in enumerate(results):
+                print(f"\n  Entry {i+1}:")
+                print(f"    Timestamp: {row[0]}")
+                print(f"    Image Index: {row[1]}")
+                print(f"    Original Prompt: {row[2][:100]}...")
+                print(f"    Evaluation Score: {row[3]}")
+                print(f"    Confidence Score: {row[4]}")
+                print(f"    Regeneration Count: {row[5]}")
+                print(f"    Reference Image: {row[6]}")
+                print(f"    Good Things: {row[7][:100]}...")
+                print(f"    Bad Things: {row[8][:100]}...")
+        
+        conn.close()
+        print(f"\n=== End Database Contents ===\n")
+        
+    except Exception as e:
+        print(f"Error viewing database: {str(e)}")
 
 
 def load_models(use_quantization=True):
@@ -1695,39 +2045,10 @@ def evaluation_node(state: MessagesState) -> Command[str]:
         evaluation_result = track_llm_call(llm_json.invoke, "evaluation", evaluation_prompt)
         evaluation_data = json.loads(evaluation_result.content)
 
-        # Update config with evaluation score and additional fields
+        # Update config with evaluation score
         current_config["evaluation_score"] = evaluation_data["overall_score"]
         current_config["improvement_suggestions"] = evaluation_data["improvement_suggestions"]
-        
-        # Store additional evaluation details for better analysis
-        current_config["aesthetic_reasoning"] = evaluation_data.get("aesthetic_reasoning", "")
-        current_config["alignment_reasoning"] = evaluation_data.get("alignment_reasoning", "")
-        current_config["overall_reasoning"] = evaluation_data.get("overall_reasoning", "")
-        current_config["detected_artifacts"] = evaluation_data.get("artifacts", {}).get("detected_artifacts", [])
-        current_config["artifact_reasoning"] = evaluation_data.get("artifacts", {}).get("artifact_reasoning", "")
-        current_config["main_subjects_present"] = evaluation_data.get("main_subjects_present", True)
-        current_config["missing_elements"] = evaluation_data.get("missing_elements", [])
-        
         logger.info(f"Evaluation result: {json.dumps(evaluation_data, indent=2)}")
-        
-        # Add evaluation to memory system
-        if not config.disable_memory:
-            try:
-                model_name = current_config.get("selected_model", "Unknown")
-                session_id = f"{config.image_index or 0}_{int(datetime.now().timestamp())}"
-                
-                # Initialize memory manager with custom database path if needed
-                if config.memory_db_path != "model_memories.db":
-                    from memory_modules import MemoryManager
-                    global memory_manager
-                    memory_manager = MemoryManager(config.memory_db_path)
-                
-                add_evaluation_to_memory(model_name, config, session_id)
-                logger.info(f"Added evaluation to {model_name} memory")
-            except Exception as e:
-                logger.error(f"Failed to add evaluation to memory: {e}")
-        else:
-            logger.debug("Memory system disabled")
         
         # Define threshold for acceptable quality
         QUALITY_THRESHOLD = 8.0
@@ -1741,32 +2062,16 @@ def evaluation_node(state: MessagesState) -> Command[str]:
         if config.is_human_in_loop:
             
             logger.info("Human-in-loop is enabled, requesting user feedback.")
-            print("\n" + "="*50)
-            print("EVALUATION RESULTS")
-            print("="*50)
-            print(f"Overall Score: {current_config['evaluation_score']}/10.0")
-            print(f"Main Subjects Present: {current_config.get('main_subjects_present', 'Unknown')}")
-            
-            if current_config.get('missing_elements'):
-                print(f"Missing Elements: {', '.join(current_config['missing_elements'])}")
-            
-            if current_config.get('detected_artifacts'):
-                print(f"Detected Artifacts: {', '.join(current_config['detected_artifacts'])}")
-            
-            print(f"\nAesthetic Reasoning: {current_config.get('aesthetic_reasoning', 'Not available')}")
-            print(f"Alignment Reasoning: {current_config.get('alignment_reasoning', 'Not available')}")
-            print(f"Overall Reasoning: {current_config.get('overall_reasoning', 'Not available')}")
-            print(f"\nImprovement Suggestions: {current_config['improvement_suggestions']}")
-            print("="*50)
+            print("\nCurrent evaluation score:", current_config['evaluation_score'])
+            print("Evaluation feedback:", current_config['improvement_suggestions'])
             # TODO: visualize the image for user to evalute
             
             feedback_type = input("\nWould you like to provide feedback?\n0. I like the image and no need to regenerate\n1. Provide text suggestions\n2. Skip feedback but want regenerate the image\nEnter choice (0-2): ")
             if feedback_type == "0":
                 logger.info("User likes the image, no need to regenerate.")
                 final_message = (
-                    f"Final image generated with score: {current_config['evaluation_score']}/10.0\n"
-                    f"Overall reasoning: {current_config.get('overall_reasoning', 'Not available')}\n"
-                    f"Improvement suggestions: {current_config['improvement_suggestions']}\n"
+                    f"Final image generated with score: {current_config['evaluation_score']}\n"
+                    f"Detailed feedback: {current_config['improvement_suggestions']}\n"
                     f"User feedback: User likes the image, no need to regenerate."
                 )
                 comment = Command(
@@ -1816,9 +2121,8 @@ def evaluation_node(state: MessagesState) -> Command[str]:
         
         # If quality is acceptable or max attempts reached
         final_message = (
-            f"Final image generated with score: {current_config['evaluation_score']}/10.0\n"
-            f"Overall reasoning: {current_config.get('overall_reasoning', 'Not available')}\n"
-            f"Improvement suggestions: {current_config['improvement_suggestions']}"
+            f"Final image generated with score: {current_config['evaluation_score']}\n"
+            f"Detailed feedback: {current_config['improvement_suggestions']}"
         )
         
         if config.regeneration_count >= MAX_REGENERATION_ATTEMPTS and not config.is_human_in_loop:
@@ -1915,7 +2219,7 @@ def track_llm_call(llm_func, llm_type, *args, **kwargs):
     llm_token_counts[llm_type].append((prompt_tokens, completion_tokens, total_tokens))
     return response
 
-def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, open_llm_model="mistralai/Mistral-Small-3.1-24B-Instruct-2503", open_llm_host="0.0.0.0", open_llm_port="8000", calculate_latency=False, memory_db_path="model_memories.db", disable_memory=False, use_quantization=True):
+def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, open_llm_model="mistralai/Mistral-Small-3.1-24B-Instruct-2503", open_llm_host="0.0.0.0", open_llm_port="8000", calculate_latency=False, use_quantization=True):
     """Main CLI entry point."""
     # Check CUDA availability and initialize
     if not torch.cuda.is_available():
@@ -1936,6 +2240,7 @@ def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, o
     global llm_latencies, llm_token_counts
     global model_inference_times
     global llm, llm_json
+    global memory_manager
 
     # Initialize LLMs based on open_llm flag
     llm, llm_json = initialize_llms(use_open_llm, open_llm_model=open_llm_model, local_host=open_llm_host, local_port=open_llm_port)
@@ -2062,8 +2367,6 @@ def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, o
             config.open_llm_model = open_llm_model 
             config.open_llm_host = open_llm_host 
             config.open_llm_port = open_llm_port 
-            config.memory_db_path = memory_db_path
-            config.disable_memory = disable_memory 
             
             # Handle different benchmark types consistently
             if "GenAIBenchmark" in str(benchmark_name):
@@ -2079,6 +2382,9 @@ def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, o
             # Setup logging for this iteration
             logger = setup_logging(save_dir, filename=f"{config.image_index}.log", console_output=False)
             config.logger = logger
+
+            # Initialize memory manager for this iteration
+            memory_manager = MemoryManager()
 
             # start timing
             torch.cuda.reset_peak_memory_stats(0)
@@ -2096,6 +2402,15 @@ def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, o
             config_save_path = os.path.join(save_dir, f"{config.image_index}_config.json")
             config.save_to_file(config_save_path)
             logger.info(f"Saved config state to: {config_save_path}")
+            
+            # Analyze and save model performance to memory database
+            try:
+                logger.info("Analyzing model performance and saving to memory database...")
+                memory_manager.save_model_memory(config.to_dict())
+                logger.info("Successfully saved model performance analysis to memory database")
+            except Exception as e:
+                logger.error(f"Failed to save model performance analysis: {str(e)}")
+            
             # End timing & record stats
             end_time = time.time()
             inference_time = end_time - start_time
@@ -2155,7 +2470,7 @@ def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, o
         # Calculate and print average time
         # avg_time = total_time / progress_data["current_idx"]
         # print(f"\nAverage inference time per image: {avg_time:.4f} seconds")
-        # print(f"Total time for {progress_data["current_idx"]} images: {total_time:.4f} seconds")
+        # print(f"Total time for {progress_data['current_idx']} images: {total_time:.4f} seconds")
         
         # summary output
         if calculate_latency:
@@ -2191,34 +2506,6 @@ def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, o
                 print(f"GPU max memory usage: {max(max_gpu_memories):.2f} GB / {total_gpu_memory:.2f} GB")
             else:
                 print("GPU max memory usage: 0.00 GB (fail to log)")
-        
-        # Display memory statistics at the end
-        if not disable_memory:
-            try:
-                manager = get_memory_manager(memory_db_path)
-                memory_summary = manager.get_memory_summary()
-                
-                print("\n==== Memory Statistics ====")
-                for model_name, stats in memory_summary.items():
-                    if stats['total_evaluations'] > 0:
-                        print(f"\n{model_name}:")
-                        print(f"  Total evaluations: {stats['total_evaluations']}")
-                        print(f"  Average score: {stats['average_score']:.2f}")
-                        print(f"  Score range: {stats['min_score']:.1f} - {stats['max_score']:.1f}")
-                        print(f"  Recent average (last 10): {stats['recent_average']:.2f}")
-                        print(f"  Unique sessions: {stats['unique_sessions']}")
-                        
-                        if stats['score_distribution']:
-                            print(f"  Score distribution: {stats['score_distribution']}")
-                    else:
-                        print(f"\n{model_name}: No evaluations recorded")
-                        
-            except Exception as e:
-                print(f"\nMemory statistics unavailable: {e}")
-        else:
-            print("\n==== Memory System Disabled ====")
-            print("  Use --memory_db_path to specify database location")
-            print("  Remove --disable_memory flag to enable memory system")
 
 
 if __name__ == "__main__":
@@ -2232,8 +2519,12 @@ if __name__ == "__main__":
     parser.add_argument('--open_llm_host', default='0.0.0.0', type=str, help='Host address for the open LLM server')
     parser.add_argument('--open_llm_port', default='8000', type=str, help='Port for the open LLM server')
     parser.add_argument('--calculate_latency', action='store_true', help='Calculate and print latency statistics')
-    parser.add_argument('--memory_db_path', default='model_memories.db', type=str, help='Path to the memory database file')
-    parser.add_argument('--disable_memory', action='store_true', help='Disable memory system (for testing or reduced overhead)')
+    parser.add_argument('--view_memory', action='store_true', help='View contents of the model memory database')
 
     args = parser.parse_args()
-    main(args.benchmark_name, args.human_in_the_loop, args.model_version, args.use_open_llm, args.open_llm_model, args.open_llm_host, args.open_llm_port, args.calculate_latency, args.memory_db_path, args.disable_memory)
+    
+    # Handle memory viewing separately
+    if args.view_memory:
+        view_memory_database()
+    else:
+        main(args.benchmark_name, args.human_in_the_loop, args.model_version, args.use_open_llm, args.open_llm_model, args.open_llm_host, args.open_llm_port, args.calculate_latency)
