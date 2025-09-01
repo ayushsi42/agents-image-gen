@@ -735,10 +735,20 @@ Consider the scene type, style, and content to determine what should be avoided.
 class MemoryManager:
     """Manages global memory for model performance analysis using SQLite."""
     
-    def __init__(self, db_path: str = "model_memory.db", pattern_extraction_frequency: int = 10):
+    def __init__(self, db_path: str = "model_memory.db", pattern_extraction_frequency: int = 10, logger=None):
         self.db_path = db_path
         self.pattern_extraction_frequency = pattern_extraction_frequency
         self.logger = logger
+        if self.logger is None:
+            # Create a simple logger if none provided
+            import logging
+            self.logger = logging.getLogger(__name__)
+            if not self.logger.handlers:
+                handler = logging.StreamHandler()
+                formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+                handler.setFormatter(formatter)
+                self.logger.addHandler(handler)
+                self.logger.setLevel(logging.INFO)
         self._init_database()
     
     def _init_database(self):
@@ -885,12 +895,13 @@ class MemoryManager:
     
     def _analyze_model_performance(self, config_data: Dict[str, Any], process_summary: str, model_name: str, regen_config: Dict[str, Any]) -> Dict[str, str]:
         """Use LLM to analyze model performance and extract good/bad things, including visual analysis of generated images."""
-        try:
-            # Prepare the message content for the LLM
-            message_content = []
-            
-            # Add the text analysis part
-            analysis_text = f"""You are an expert AI model performance analyst. Analyze the following image generation workflow and extract insights about the {model_name} model's performance.
+        global llm_json
+        
+        # Prepare the message content for the LLM
+        message_content = []
+        
+        # Add the text analysis part
+        analysis_text = f"""You are an expert AI model performance analyst. Analyze the following image generation workflow and extract insights about the {model_name} model's performance.
 
 WORKFLOW SUMMARY:
 {process_summary}
@@ -928,95 +939,88 @@ Return a JSON response with:
 
 Focus on actionable insights that could help improve future model selection and parameter tuning."""
 
+        message_content.append({
+            "type": "text",
+            "text": analysis_text
+        })
+        
+        # Add the generated image for analysis
+        gen_image_path = regen_config.get('gen_image_path', '')
+        if gen_image_path and os.path.exists(gen_image_path):
+            try:
+                with open(gen_image_path, "rb") as image_file:
+                    base64_gen_image = base64.b64encode(image_file.read()).decode()
+                
+                message_content.append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/png;base64,{base64_gen_image}",
+                        "detail": "high"
+                    }
+                })
+                message_content.append({
+                    "type": "text", 
+                    "text": f"↑ Generated Image by {model_name}"
+                })
+                self.logger.debug(f"Added generated image to analysis: {gen_image_path}")
+            except Exception as e:
+                self.logger.warning(f"Could not load generated image {gen_image_path}: {str(e)}")
+                message_content.append({
+                    "type": "text",
+                    "text": f"[Generated image could not be loaded: {gen_image_path}]"
+                })
+        else:
             message_content.append({
                 "type": "text",
-                "text": analysis_text
+                "text": f"[No generated image available for analysis: {gen_image_path}]"
             })
-            
-            # Add the generated image for analysis
-            gen_image_path = regen_config.get('gen_image_path', '')
-            if gen_image_path and os.path.exists(gen_image_path):
+        
+        # For Qwen-Image-Edit, also include the reference image for comparison
+        if model_name == "Qwen-Image-Edit":
+            ref_image_path = regen_config.get('reference_content_image', '')
+            if ref_image_path and os.path.exists(ref_image_path):
                 try:
-                    with open(gen_image_path, "rb") as image_file:
-                        base64_gen_image = base64.b64encode(image_file.read()).decode()
+                    with open(ref_image_path, "rb") as image_file:
+                        base64_ref_image = base64.b64encode(image_file.read()).decode()
                     
                     message_content.append({
                         "type": "image_url",
                         "image_url": {
-                            "url": f"data:image/png;base64,{base64_gen_image}",
+                            "url": f"data:image/png;base64,{base64_ref_image}",
                             "detail": "high"
                         }
                     })
                     message_content.append({
-                        "type": "text", 
-                        "text": f"↑ Generated Image by {model_name}"
+                        "type": "text",
+                        "text": "↑ Reference Image (input for editing)"
                     })
-                    self.logger.debug(f"Added generated image to analysis: {gen_image_path}")
-                except Exception as e:
-                    self.logger.warning(f"Could not load generated image {gen_image_path}: {str(e)}")
                     message_content.append({
                         "type": "text",
-                        "text": f"[Generated image could not be loaded: {gen_image_path}]"
+                        "text": "Please compare the reference image with the generated image to analyze how well the editing was performed."
                     })
-            else:
-                message_content.append({
-                    "type": "text",
-                    "text": f"[No generated image available for analysis: {gen_image_path}]"
-                })
-            
-            # For Qwen-Image-Edit, also include the reference image for comparison
-            if model_name == "Qwen-Image-Edit":
-                ref_image_path = regen_config.get('reference_content_image', '')
-                if ref_image_path and os.path.exists(ref_image_path):
-                    try:
-                        with open(ref_image_path, "rb") as image_file:
-                            base64_ref_image = base64.b64encode(image_file.read()).decode()
-                        
-                        message_content.append({
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/png;base64,{base64_ref_image}",
-                                "detail": "high"
-                            }
-                        })
-                        message_content.append({
-                            "type": "text",
-                            "text": "↑ Reference Image (input for editing)"
-                        })
-                        message_content.append({
-                            "type": "text",
-                            "text": "Please compare the reference image with the generated image to analyze how well the editing was performed."
-                        })
-                        self.logger.debug(f"Added reference image to analysis: {ref_image_path}")
-                    except Exception as e:
-                        self.logger.warning(f"Could not load reference image {ref_image_path}: {str(e)}")
-                        message_content.append({
-                            "type": "text",
-                            "text": f"[Reference image could not be loaded: {ref_image_path}]"
-                        })
+                    self.logger.debug(f"Added reference image to analysis: {ref_image_path}")
+                except Exception as e:
+                    self.logger.warning(f"Could not load reference image {ref_image_path}: {str(e)}")
+                    message_content.append({
+                        "type": "text",
+                        "text": f"[Reference image could not be loaded: {ref_image_path}]"
+                    })
 
-            # Make the LLM call with visual content
-            response = track_llm_call(llm_json.invoke, "model_performance_analysis", [
-                ("system", "You are an expert AI model performance analyst with strong visual analysis capabilities."),
-                ("human", message_content)
-            ])
-            
-            if isinstance(response.content, str):
-                result = json.loads(response.content)
-            elif isinstance(response.content, dict):
-                result = response.content
-            else:
-                raise ValueError(f"Unexpected response type: {type(response.content)}")
-            
-            self.logger.debug(f"Model analysis for {model_name}: {result}")
-            return result
-            
-        except Exception as e:
-            self.logger.error(f"Failed to analyze model performance for {model_name}: {str(e)}")
-            return {
-                "good_things": f"Analysis failed: {str(e)}",
-                "bad_things": f"Analysis failed: {str(e)}"
-            }
+        # Make the LLM call with visual content
+        response = track_llm_call(llm_json.invoke, "model_performance_analysis", [
+            ("system", "You are an expert AI model performance analyst with strong visual analysis capabilities."),
+            ("human", message_content)
+        ])
+        
+        if isinstance(response.content, str):
+            result = json.loads(response.content)
+        elif isinstance(response.content, dict):
+            result = response.content
+        else:
+            raise ValueError(f"Unexpected response type: {type(response.content)}")
+        
+        self.logger.debug(f"Model analysis for {model_name}: {result}")
+        return result
     
     def _extract_patterns_from_global_memory(self, model_name: str) -> Dict[str, str]:
         """Extract patterns from global memory using LLM analysis."""
@@ -1235,98 +1239,117 @@ Return JSON format:
     
     def save_model_memory(self, config_data: Dict[str, Any]):
         """Save model performance analysis to memory database."""
-        try:
-            # Generate process summary
-            process_summary = self._generate_process_summary(config_data)
+        print(f"DEBUG: save_model_memory called with config_data keys: {list(config_data.keys())}")
+        
+        # Generate process summary
+        process_summary = self._generate_process_summary(config_data)
+        print(f"DEBUG: Generated process summary: {len(process_summary)} characters")
+        
+        # Get regeneration configs to determine which models were used
+        regen_configs = config_data.get("regeneration_configs", {})
+        regen_count = config_data.get("regeneration_count", 0)
+        
+        print(f"DEBUG: regen_configs keys: {list(regen_configs.keys())}")
+        print(f"DEBUG: regen_count: {regen_count}")
+        
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        timestamp = datetime.now().isoformat()
+        
+        # Process each regeneration attempt
+        for i in range(regen_count + 1):
+            config_key = f"count_{i}"
+            print(f"DEBUG: Processing attempt {i}, looking for config_key: {config_key}")
             
-            # Get regeneration configs to determine which models were used
-            regen_configs = config_data.get("regeneration_configs", {})
-            regen_count = config_data.get("regeneration_count", 0)
+            if config_key not in regen_configs:
+                print(f"DEBUG: Config key {config_key} not found in regen_configs")
+                continue
+                
+            regen_config = regen_configs[config_key]
+            model_name = regen_config.get('selected_model', '')
             
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            timestamp = datetime.now().isoformat()
+            print(f"DEBUG: Found regen_config for attempt {i}, model_name: {model_name}")
             
-            # Process each regeneration attempt
-            for i in range(regen_count + 1):
-                config_key = f"count_{i}"
-                if config_key not in regen_configs:
-                    continue
-                    
-                regen_config = regen_configs[config_key]
-                model_name = regen_config.get('selected_model', '')
+            if not model_name:
+                print(f"DEBUG: No model_name found for attempt {i}")
+                continue
+            
+            print(f"DEBUG: About to analyze model performance for {model_name}")
+            # Analyze model performance
+            analysis = self._analyze_model_performance(config_data, process_summary, model_name, regen_config)
+            print(f"DEBUG: Got analysis result: {analysis}")
+            
+            # Prepare common data
+            common_data = {
+                'timestamp': timestamp,
+                'image_index': str(config_data.get('image_index', '')),
+                'original_prompt': config_data.get('prompt_understanding', {}).get('original_prompt', ''),
+                'refined_prompt': config_data.get('prompt_understanding', {}).get('refined_prompt', ''),
+                'evaluation_score': regen_config.get('evaluation_score', 0.0),
+                'confidence_score': regen_config.get('confidence_score', 0.0),
+                'regeneration_count': i,
+                'good_things': analysis.get('good_things', ''),
+                'bad_things': analysis.get('bad_things', ''),
+                'config_data': json.dumps(config_data),
+                'process_summary': process_summary
+            }
+            
+            print(f"DEBUG: Prepared common_data for {model_name}")
+            
+            if model_name == "Qwen-Image":
+                print(f"DEBUG: Inserting into qwen_image_memory")
+                cursor.execute('''
+                    INSERT INTO qwen_image_memory 
+                    (timestamp, image_index, original_prompt, refined_prompt, evaluation_score, 
+                     confidence_score, regeneration_count, good_things, bad_things, config_data, process_summary)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    common_data['timestamp'], common_data['image_index'], common_data['original_prompt'],
+                    common_data['refined_prompt'], common_data['evaluation_score'], common_data['confidence_score'],
+                    common_data['regeneration_count'], common_data['good_things'], common_data['bad_things'],
+                    common_data['config_data'], common_data['process_summary']
+                ))
+                self.logger.info(f"Saved Qwen-Image memory for attempt {i+1}")
+                print(f"DEBUG: Successfully inserted into qwen_image_memory for attempt {i+1}")
                 
-                if not model_name:
-                    continue
-                
-                # Analyze model performance
-                analysis = self._analyze_model_performance(config_data, process_summary, model_name, regen_config)
-                
-                # Prepare common data
-                common_data = {
-                    'timestamp': timestamp,
-                    'image_index': str(config_data.get('image_index', '')),
-                    'original_prompt': config_data.get('prompt_understanding', {}).get('original_prompt', ''),
-                    'refined_prompt': config_data.get('prompt_understanding', {}).get('refined_prompt', ''),
-                    'evaluation_score': regen_config.get('evaluation_score', 0.0),
-                    'confidence_score': regen_config.get('confidence_score', 0.0),
-                    'regeneration_count': i,
-                    'good_things': analysis.get('good_things', ''),
-                    'bad_things': analysis.get('bad_things', ''),
-                    'config_data': json.dumps(config_data),
-                    'process_summary': process_summary
-                }
-                
-                if model_name == "Qwen-Image":
+            elif model_name == "Qwen-Image-Edit":
+                # Only save Qwen-Image-Edit memory if there was regeneration (i > 0)
+                if i > 0:
+                    print(f"DEBUG: Inserting into qwen_image_edit_memory")
                     cursor.execute('''
-                        INSERT INTO qwen_image_memory 
+                        INSERT INTO qwen_image_edit_memory 
                         (timestamp, image_index, original_prompt, refined_prompt, evaluation_score, 
-                         confidence_score, regeneration_count, good_things, bad_things, config_data, process_summary)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         confidence_score, regeneration_count, reference_image, good_things, bad_things, 
+                         config_data, process_summary)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ''', (
                         common_data['timestamp'], common_data['image_index'], common_data['original_prompt'],
                         common_data['refined_prompt'], common_data['evaluation_score'], common_data['confidence_score'],
-                        common_data['regeneration_count'], common_data['good_things'], common_data['bad_things'],
+                        common_data['regeneration_count'], regen_config.get('reference_content_image', ''),
+                        common_data['good_things'], common_data['bad_things'],
                         common_data['config_data'], common_data['process_summary']
                     ))
-                    self.logger.info(f"Saved Qwen-Image memory for attempt {i+1}")
-                    
-                elif model_name == "Qwen-Image-Edit":
-                    # Only save Qwen-Image-Edit memory if there was regeneration (i > 0)
-                    if i > 0:
-                        cursor.execute('''
-                            INSERT INTO qwen_image_edit_memory 
-                            (timestamp, image_index, original_prompt, refined_prompt, evaluation_score, 
-                             confidence_score, regeneration_count, reference_image, good_things, bad_things, 
-                             config_data, process_summary)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        ''', (
-                            common_data['timestamp'], common_data['image_index'], common_data['original_prompt'],
-                            common_data['refined_prompt'], common_data['evaluation_score'], common_data['confidence_score'],
-                            common_data['regeneration_count'], regen_config.get('reference_content_image', ''),
-                            common_data['good_things'], common_data['bad_things'],
-                            common_data['config_data'], common_data['process_summary']
-                        ))
-                        self.logger.info(f"Saved Qwen-Image-Edit memory for regeneration attempt {i+1}")
-            
-            conn.commit()
-            conn.close()
-            self.logger.info(f"Successfully saved model memory to database: {self.db_path}")
-            
-            # Check and extract patterns for each model type used
-            models_used = set()
-            for i in range(regen_count + 1):
-                config_key = f"count_{i}"
-                if config_key in regen_configs:
-                    model_name = regen_configs[config_key].get('selected_model', '')
-                    if model_name:
-                        models_used.add(model_name)
-            
-            for model_name in models_used:
-                self._check_and_extract_patterns(model_name)
-            
-        except Exception as e:
-            self.logger.error(f"Failed to save model memory: {str(e)}")
+                    self.logger.info(f"Saved Qwen-Image-Edit memory for regeneration attempt {i+1}")
+                    print(f"DEBUG: Successfully inserted into qwen_image_edit_memory for attempt {i+1}")
+        
+        print(f"DEBUG: About to commit changes to database")
+        conn.commit()
+        conn.close()
+        self.logger.info(f"Successfully saved model memory to database: {self.db_path}")
+        print(f"DEBUG: Database operations completed successfully")
+        
+        # Check and extract patterns for each model type used
+        models_used = set()
+        for i in range(regen_count + 1):
+            config_key = f"count_{i}"
+            if config_key in regen_configs:
+                model_name = regen_configs[config_key].get('selected_model', '')
+                if model_name:
+                    models_used.add(model_name)
+        
+        print(f"DEBUG: Models used: {models_used}")
+        for model_name in models_used:
+            self._check_and_extract_patterns(model_name)
     
     def get_model_memory_summary(self, model_name: str, limit: int = 10) -> List[Dict]:
         """Retrieve recent memory entries for a specific model."""
@@ -2677,7 +2700,7 @@ def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, o
     # Initialize LLMs based on open_llm flag
     llm, llm_json = initialize_llms(use_open_llm, open_llm_model=open_llm_model, local_host=open_llm_host, local_port=open_llm_port)
 
-    # Initialize memory manager
+    # Initialize memory manager (will create its own logger initially)
     memory_manager = MemoryManager()
 
     # Get workflow
@@ -2760,7 +2783,8 @@ def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, o
             "evaluation": [],
             "negative_prompt_generation": [],
             "polish_prompt": [],
-            "creativity_determination": []
+            "creativity_determination": [],
+            "model_performance_analysis": []
         }
         llm_token_counts = {
             "intention_analysis": [], 
@@ -2769,7 +2793,8 @@ def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, o
             "evaluation": [],
             "negative_prompt_generation": [],
             "polish_prompt": [],
-            "creativity_determination": []
+            "creativity_determination": [],
+            "model_performance_analysis": []
         }
         single_turn_count = 0
         multi_turn_count = 0
@@ -2818,8 +2843,8 @@ def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, o
             logger = setup_logging(save_dir, filename=f"{config.image_index}.log", console_output=False)
             config.logger = logger
 
-            # Initialize memory manager for this iteration
-            memory_manager = MemoryManager()
+            # Initialize memory manager for this iteration with proper logger
+            memory_manager = MemoryManager(logger=logger)
 
             # start timing
             torch.cuda.reset_peak_memory_stats(0)
