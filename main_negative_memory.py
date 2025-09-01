@@ -735,8 +735,9 @@ Consider the scene type, style, and content to determine what should be avoided.
 class MemoryManager:
     """Manages global memory for model performance analysis using SQLite."""
     
-    def __init__(self, db_path: str = "model_memory.db"):
+    def __init__(self, db_path: str = "model_memory.db", pattern_extraction_frequency: int = 10):
         self.db_path = db_path
+        self.pattern_extraction_frequency = pattern_extraction_frequency
         self.logger = logger
         self._init_database()
     
@@ -780,6 +781,34 @@ class MemoryManager:
                     bad_things TEXT,
                     config_data TEXT,
                     process_summary TEXT
+                )
+            ''')
+            
+            # Table for Qwen-Image local memory (extracted patterns)
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS qwen_image_local_memory (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    extraction_run_count INTEGER,
+                    successful_prompt_patterns TEXT,
+                    common_good_practices TEXT,
+                    common_bad_patterns TEXT,
+                    refinement_strategies TEXT,
+                    pattern_summary TEXT
+                )
+            ''')
+            
+            # Table for Qwen-Image-Edit local memory (extracted patterns)
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS qwen_image_edit_local_memory (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    extraction_run_count INTEGER,
+                    successful_prompt_patterns TEXT,
+                    common_good_practices TEXT,
+                    common_bad_patterns TEXT,
+                    refinement_strategies TEXT,
+                    pattern_summary TEXT
                 )
             ''')
             
@@ -854,10 +883,14 @@ class MemoryManager:
             self.logger.error(f"Failed to generate process summary: {str(e)}")
             return f"Error generating summary: {str(e)}"
     
-    def _analyze_model_performance(self, config_data: Dict[str, Any], process_summary: str, model_name: str) -> Dict[str, str]:
-        """Use LLM to analyze model performance and extract good/bad things."""
+    def _analyze_model_performance(self, config_data: Dict[str, Any], process_summary: str, model_name: str, regen_config: Dict[str, Any]) -> Dict[str, str]:
+        """Use LLM to analyze model performance and extract good/bad things, including visual analysis of generated images."""
         try:
-            analysis_prompt = f"""You are an expert AI model performance analyst. Analyze the following image generation workflow and extract insights about the {model_name} model's performance.
+            # Prepare the message content for the LLM
+            message_content = []
+            
+            # Add the text analysis part
+            analysis_text = f"""You are an expert AI model performance analyst. Analyze the following image generation workflow and extract insights about the {model_name} model's performance.
 
 WORKFLOW SUMMARY:
 {process_summary}
@@ -865,28 +898,107 @@ WORKFLOW SUMMARY:
 DETAILED CONFIG DATA:
 {json.dumps(config_data, indent=2)}
 
+CURRENT MODEL GENERATION CONFIG:
+{json.dumps(regen_config, indent=2)}
+
 Please analyze this specific model's performance considering:
 1. Model Selection Reasoning: Why was this model chosen? Was it appropriate?
 2. Confidence Scores: How confident was the system in the model choice?
 3. Evaluation Scores: How well did the model perform according to automated evaluation?
 4. Prompt Handling: How well did the model handle the given prompt complexity?
 5. Reference Image Usage: (For Qwen-Image-Edit) How well did it utilize reference images?
-6. Generation Quality: Based on evaluation scores and feedback
-7. Efficiency: Time taken, resource usage if available
+6. Generation Quality: Based on evaluation scores, feedback, AND visual analysis of the actual generated image
+7. Visual Coherence: Composition, color harmony, detail quality, prompt adherence
+8. Technical Quality: Resolution, clarity, artifacts, overall image quality
 
-Extract and categorize insights into good and bad aspects. Be specific and actionable.
+IMPORTANT: You will see the actual generated image(s) below. Use visual analysis to provide specific insights about:
+- How well the image matches the original prompt
+- Visual quality and technical execution
+- Artistic composition and aesthetic appeal
+- Any visual artifacts or issues
+- Comparison with reference image (for edit tasks)
+
+Extract and categorize insights into good and bad aspects. Be specific and actionable, referencing what you see in the image(s).
 
 Return a JSON response with:
 {{
-    "good_things": "Detailed description of what the model did well, specific strengths observed, successful aspects of the generation process",
-    "bad_things": "Detailed description of issues, weaknesses, areas for improvement, specific problems encountered"
+    "good_things": "Detailed description of what the model did well, specific visual strengths observed, successful aspects of the generation process based on actual image analysis",
+    "bad_things": "Detailed description of visual issues, technical weaknesses, areas for improvement, specific problems you can see in the generated image"
 }}
 
 Focus on actionable insights that could help improve future model selection and parameter tuning."""
 
+            message_content.append({
+                "type": "text",
+                "text": analysis_text
+            })
+            
+            # Add the generated image for analysis
+            gen_image_path = regen_config.get('gen_image_path', '')
+            if gen_image_path and os.path.exists(gen_image_path):
+                try:
+                    with open(gen_image_path, "rb") as image_file:
+                        base64_gen_image = base64.b64encode(image_file.read()).decode()
+                    
+                    message_content.append({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{base64_gen_image}",
+                            "detail": "high"
+                        }
+                    })
+                    message_content.append({
+                        "type": "text", 
+                        "text": f"↑ Generated Image by {model_name}"
+                    })
+                    self.logger.debug(f"Added generated image to analysis: {gen_image_path}")
+                except Exception as e:
+                    self.logger.warning(f"Could not load generated image {gen_image_path}: {str(e)}")
+                    message_content.append({
+                        "type": "text",
+                        "text": f"[Generated image could not be loaded: {gen_image_path}]"
+                    })
+            else:
+                message_content.append({
+                    "type": "text",
+                    "text": f"[No generated image available for analysis: {gen_image_path}]"
+                })
+            
+            # For Qwen-Image-Edit, also include the reference image for comparison
+            if model_name == "Qwen-Image-Edit":
+                ref_image_path = regen_config.get('reference_content_image', '')
+                if ref_image_path and os.path.exists(ref_image_path):
+                    try:
+                        with open(ref_image_path, "rb") as image_file:
+                            base64_ref_image = base64.b64encode(image_file.read()).decode()
+                        
+                        message_content.append({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{base64_ref_image}",
+                                "detail": "high"
+                            }
+                        })
+                        message_content.append({
+                            "type": "text",
+                            "text": "↑ Reference Image (input for editing)"
+                        })
+                        message_content.append({
+                            "type": "text",
+                            "text": "Please compare the reference image with the generated image to analyze how well the editing was performed."
+                        })
+                        self.logger.debug(f"Added reference image to analysis: {ref_image_path}")
+                    except Exception as e:
+                        self.logger.warning(f"Could not load reference image {ref_image_path}: {str(e)}")
+                        message_content.append({
+                            "type": "text",
+                            "text": f"[Reference image could not be loaded: {ref_image_path}]"
+                        })
+
+            # Make the LLM call with visual content
             response = track_llm_call(llm_json.invoke, "model_performance_analysis", [
-                ("system", "You are an expert AI model performance analyst."),
-                ("human", analysis_prompt)
+                ("system", "You are an expert AI model performance analyst with strong visual analysis capabilities."),
+                ("human", message_content)
             ])
             
             if isinstance(response.content, str):
@@ -904,6 +1016,221 @@ Focus on actionable insights that could help improve future model selection and 
             return {
                 "good_things": f"Analysis failed: {str(e)}",
                 "bad_things": f"Analysis failed: {str(e)}"
+            }
+    
+    def _extract_patterns_from_global_memory(self, model_name: str) -> Dict[str, str]:
+        """Extract patterns from global memory using LLM analysis."""
+        try:
+            # Determine table name
+            table_name = f"{model_name.lower().replace('-', '_')}_memory"
+            
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # Get recent high-scoring entries for pattern analysis
+            cursor.execute(f'''
+                SELECT original_prompt, refined_prompt, evaluation_score, good_things, bad_things, process_summary
+                FROM {table_name}
+                WHERE evaluation_score >= 7.0
+                ORDER BY timestamp DESC
+                LIMIT 50
+            ''')
+            high_score_entries = cursor.fetchall()
+            
+            # Get all entries for broader pattern analysis
+            cursor.execute(f'''
+                SELECT original_prompt, refined_prompt, evaluation_score, good_things, bad_things
+                FROM {table_name}
+                ORDER BY timestamp DESC
+                LIMIT 100
+            ''')
+            all_entries = cursor.fetchall()
+            
+            conn.close()
+            
+            if len(all_entries) < 5:  # Need minimum data for pattern extraction
+                return {
+                    "successful_prompt_patterns": "Insufficient data for pattern extraction",
+                    "common_good_practices": "Insufficient data for pattern extraction", 
+                    "common_bad_patterns": "Insufficient data for pattern extraction",
+                    "refinement_strategies": "Insufficient data for pattern extraction",
+                    "pattern_summary": "Need more runs to extract meaningful patterns"
+                }
+            
+            # Prepare data for LLM analysis
+            high_score_data = "\n".join([
+                f"Score: {entry[2]}, Original: '{entry[0]}', Refined: '{entry[1]}', Good: {entry[3]}, Bad: {entry[4]}"
+                for entry in high_score_entries[:20]  # Limit for token efficiency
+            ])
+            
+            all_scores_summary = f"Total entries: {len(all_entries)}, High scores (>=7.0): {len(high_score_entries)}"
+            
+            # LLM prompt for pattern extraction
+            pattern_extraction_prompt = f"""You are an expert at analyzing image generation patterns to extract actionable insights.
+
+Analyze the following {model_name} performance data and extract patterns that can improve future generations:
+
+=== HIGH SCORING ENTRIES (Score >= 7.0) ===
+{high_score_data}
+
+=== SUMMARY ===
+{all_scores_summary}
+
+Extract the following patterns as concise, actionable text summaries:
+
+1. SUCCESSFUL PROMPT PATTERNS: What characteristics do high-scoring prompts share? (style keywords, structure, specificity level, etc.)
+
+2. COMMON GOOD PRACTICES: What "good things" appear frequently in successful generations? Focus on elements that should be encouraged.
+
+3. COMMON BAD PATTERNS: What problems or "bad things" appear frequently? Focus on what should be avoided.
+
+4. REFINEMENT STRATEGIES: What refinement approaches lead to better results? How are prompts successfully improved?
+
+Keep each section under 100 words and focus on actionable insights that can guide future prompt generation.
+
+Return JSON format:
+{{
+    "successful_prompt_patterns": "text summary",
+    "common_good_practices": "text summary", 
+    "common_bad_patterns": "text summary",
+    "refinement_strategies": "text summary",
+    "pattern_summary": "brief overall insight summary"
+}}"""
+
+            # Use LLM to extract patterns
+            llm_with_json = ChatOpenAI(
+                model="openai/gpt-4o-mini",
+                openai_api_base="https://openrouter.ai/api/v1",
+                response_format={"type": "json_object"}
+            )
+            
+            response = llm_with_json.invoke([("human", pattern_extraction_prompt)])
+            patterns = json.loads(response.content)
+            
+            self.logger.info(f"Extracted patterns for {model_name}")
+            return patterns
+            
+        except Exception as e:
+            self.logger.error(f"Error extracting patterns for {model_name}: {str(e)}")
+            return {
+                "successful_prompt_patterns": "Error in pattern extraction",
+                "common_good_practices": "Error in pattern extraction",
+                "common_bad_patterns": "Error in pattern extraction", 
+                "refinement_strategies": "Error in pattern extraction",
+                "pattern_summary": "Pattern extraction failed"
+            }
+    
+    def _save_patterns_to_local_memory(self, model_name: str, patterns: Dict[str, str], run_count: int):
+        """Save extracted patterns to local memory table."""
+        try:
+            # Determine table name for local memory
+            local_table_name = f"{model_name.lower().replace('-', '_')}_local_memory"
+            
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # Insert patterns
+            cursor.execute(f'''
+                INSERT INTO {local_table_name} 
+                (timestamp, extraction_run_count, successful_prompt_patterns, common_good_practices, 
+                 common_bad_patterns, refinement_strategies, pattern_summary)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                datetime.now().isoformat(),
+                run_count,
+                patterns["successful_prompt_patterns"],
+                patterns["common_good_practices"],
+                patterns["common_bad_patterns"],
+                patterns["refinement_strategies"],
+                patterns["pattern_summary"]
+            ))
+            
+            conn.commit()
+            conn.close()
+            
+            self.logger.info(f"Saved patterns to {local_table_name} for run count {run_count}")
+            
+        except Exception as e:
+            self.logger.error(f"Error saving patterns to local memory: {str(e)}")
+    
+    def _check_and_extract_patterns(self, model_name: str):
+        """Check if pattern extraction is needed and perform it."""
+        try:
+            # Determine table names
+            global_table_name = f"{model_name.lower().replace('-', '_')}_memory"
+            local_table_name = f"{model_name.lower().replace('-', '_')}_local_memory"
+            
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # Count global memory entries
+            cursor.execute(f"SELECT COUNT(*) FROM {global_table_name}")
+            global_count = cursor.fetchone()[0]
+            
+            # Get last extraction count
+            cursor.execute(f'''
+                SELECT MAX(extraction_run_count) FROM {local_table_name}
+            ''')
+            result = cursor.fetchone()
+            last_extraction_count = result[0] if result[0] is not None else 0
+            
+            conn.close()
+            
+            # Check if we need to extract patterns
+            if global_count >= last_extraction_count + self.pattern_extraction_frequency:
+                self.logger.info(f"Extracting patterns for {model_name} (global count: {global_count}, last extraction: {last_extraction_count})")
+                
+                # Extract and save patterns
+                patterns = self._extract_patterns_from_global_memory(model_name)
+                self._save_patterns_to_local_memory(model_name, patterns, global_count)
+                
+        except Exception as e:
+            self.logger.error(f"Error in pattern extraction check: {str(e)}")
+    
+    def get_latest_patterns(self, model_name: str) -> Dict[str, str]:
+        """Get the latest extracted patterns for a model."""
+        try:
+            local_table_name = f"{model_name.lower().replace('-', '_')}_local_memory"
+            
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute(f'''
+                SELECT successful_prompt_patterns, common_good_practices, common_bad_patterns, 
+                       refinement_strategies, pattern_summary
+                FROM {local_table_name}
+                ORDER BY timestamp DESC
+                LIMIT 1
+            ''')
+            
+            result = cursor.fetchone()
+            conn.close()
+            
+            if result:
+                return {
+                    "successful_prompt_patterns": result[0],
+                    "common_good_practices": result[1], 
+                    "common_bad_patterns": result[2],
+                    "refinement_strategies": result[3],
+                    "pattern_summary": result[4]
+                }
+            else:
+                return {
+                    "successful_prompt_patterns": "No patterns available yet",
+                    "common_good_practices": "No patterns available yet",
+                    "common_bad_patterns": "No patterns available yet", 
+                    "refinement_strategies": "No patterns available yet",
+                    "pattern_summary": "No patterns extracted yet"
+                }
+                
+        except Exception as e:
+            self.logger.error(f"Error getting latest patterns: {str(e)}")
+            return {
+                "successful_prompt_patterns": "Error retrieving patterns",
+                "common_good_practices": "Error retrieving patterns",
+                "common_bad_patterns": "Error retrieving patterns",
+                "refinement_strategies": "Error retrieving patterns", 
+                "pattern_summary": "Error retrieving patterns"
             }
     
     def save_model_memory(self, config_data: Dict[str, Any]):
@@ -933,7 +1260,7 @@ Focus on actionable insights that could help improve future model selection and 
                     continue
                 
                 # Analyze model performance
-                analysis = self._analyze_model_performance(config_data, process_summary, model_name)
+                analysis = self._analyze_model_performance(config_data, process_summary, model_name, regen_config)
                 
                 # Prepare common data
                 common_data = {
@@ -985,6 +1312,18 @@ Focus on actionable insights that could help improve future model selection and 
             conn.commit()
             conn.close()
             self.logger.info(f"Successfully saved model memory to database: {self.db_path}")
+            
+            # Check and extract patterns for each model type used
+            models_used = set()
+            for i in range(regen_count + 1):
+                config_key = f"count_{i}"
+                if config_key in regen_configs:
+                    model_name = regen_configs[config_key].get('selected_model', '')
+                    if model_name:
+                        models_used.add(model_name)
+            
+            for model_name in models_used:
+                self._check_and_extract_patterns(model_name)
             
         except Exception as e:
             self.logger.error(f"Failed to save model memory: {str(e)}")
@@ -1076,6 +1415,50 @@ def view_memory_database(db_path: str = "model_memory.db"):
                 print(f"    Reference Image: {row[6]}")
                 print(f"    Good Things: {row[7][:100]}...")
                 print(f"    Bad Things: {row[8][:100]}...")
+        
+        # Check Qwen-Image Local Memory (Patterns)
+        cursor.execute("SELECT COUNT(*) FROM qwen_image_local_memory")
+        qwen_image_local_count = cursor.fetchone()[0]
+        print(f"\nQwen-Image Local Memory (Patterns): {qwen_image_local_count}")
+        
+        if qwen_image_local_count > 0:
+            cursor.execute('''
+                SELECT timestamp, extraction_run_count, successful_prompt_patterns, 
+                       common_good_practices, pattern_summary
+                FROM qwen_image_local_memory 
+                ORDER BY timestamp DESC 
+                LIMIT 2
+            ''')
+            results = cursor.fetchall()
+            for i, row in enumerate(results):
+                print(f"\n  Pattern Entry {i+1}:")
+                print(f"    Timestamp: {row[0]}")
+                print(f"    Extraction Run Count: {row[1]}")
+                print(f"    Successful Patterns: {row[2][:150]}...")
+                print(f"    Good Practices: {row[3][:150]}...")
+                print(f"    Summary: {row[4][:150]}...")
+        
+        # Check Qwen-Image-Edit Local Memory (Patterns)
+        cursor.execute("SELECT COUNT(*) FROM qwen_image_edit_local_memory")
+        qwen_edit_local_count = cursor.fetchone()[0]
+        print(f"\nQwen-Image-Edit Local Memory (Patterns): {qwen_edit_local_count}")
+        
+        if qwen_edit_local_count > 0:
+            cursor.execute('''
+                SELECT timestamp, extraction_run_count, successful_prompt_patterns, 
+                       common_good_practices, pattern_summary
+                FROM qwen_image_edit_local_memory 
+                ORDER BY timestamp DESC 
+                LIMIT 2
+            ''')
+            results = cursor.fetchall()
+            for i, row in enumerate(results):
+                print(f"\n  Pattern Entry {i+1}:")
+                print(f"    Timestamp: {row[0]}")
+                print(f"    Extraction Run Count: {row[1]}")
+                print(f"    Successful Patterns: {row[2][:150]}...")
+                print(f"    Good Practices: {row[3][:150]}...")
+                print(f"    Summary: {row[4][:150]}...")
         
         conn.close()
         print(f"\n=== End Database Contents ===\n")
@@ -1362,11 +1745,12 @@ def generate_with_qwen_edit(prompt: str, negative_prompt: str, existing_image_di
 
 class ModelSelector:
     """Helper class for model selection and execution"""
-    def __init__(self, llm):
+    def __init__(self, llm, memory_manager=None):
         self.llm = llm
         self.llm_json = llm.bind(response_format={"type": "json_object"})
         self.logger = logger
         self.negative_prompt_generator = NegativePromptGenerator(llm)  # Add this line
+        self.memory_manager = memory_manager
         self.tools = {
             "Qwen-Image": generate_with_qwen_image,
             "Qwen-Image-Edit": generate_with_qwen_edit,
@@ -1603,12 +1987,60 @@ class ModelSelector:
                 Prompt understanding: {config.prompt_understanding}"""
 
 
+    def _get_memory_guidance(self, model_name: str) -> str:
+        """Get memory-based guidance for prompt generation."""
+        if not self.memory_manager:
+            return ""
+        
+        try:
+            patterns = self.memory_manager.get_latest_patterns(model_name)
+            
+            # Format patterns into guidance text
+            guidance_parts = []
+            
+            if patterns["successful_prompt_patterns"] != "No patterns available yet":
+                guidance_parts.append(f"SUCCESSFUL PATTERNS: {patterns['successful_prompt_patterns']}")
+            
+            if patterns["common_good_practices"] != "No patterns available yet":
+                guidance_parts.append(f"ENCOURAGE: {patterns['common_good_practices']}")
+            
+            if patterns["common_bad_patterns"] != "No patterns available yet":
+                guidance_parts.append(f"AVOID: {patterns['common_bad_patterns']}")
+            
+            if patterns["refinement_strategies"] != "No patterns available yet":
+                guidance_parts.append(f"REFINEMENT STRATEGIES: {patterns['refinement_strategies']}")
+            
+            if guidance_parts:
+                guidance = "MEMORY-BASED GUIDANCE:\n" + "\n".join(guidance_parts)
+                self.logger.debug(f"Added memory guidance for {model_name}: {guidance[:200]}...")
+                return guidance
+            
+        except Exception as e:
+            self.logger.error(f"Error getting memory guidance: {str(e)}")
+        
+        return ""
+
     def select_model(self) -> Dict[str, Any]:
         """Analyze the refined prompt and select the most suitable model."""
         try:
             # Create base system prompt and task-specific prompt
             base_prompt = self._create_system_prompt()
             task_prompt = self._create_task_prompt()
+
+            # Add memory guidance for both models
+            qwen_image_guidance = self._get_memory_guidance("Qwen-Image")
+            qwen_edit_guidance = self._get_memory_guidance("Qwen-Image-Edit")
+            
+            if qwen_image_guidance or qwen_edit_guidance:
+                memory_section = "\n\n=== LEARNED PATTERNS FROM PREVIOUS RUNS ===\n"
+                if qwen_image_guidance:
+                    memory_section += f"\nFor Qwen-Image:\n{qwen_image_guidance}\n"
+                if qwen_edit_guidance:
+                    memory_section += f"\nFor Qwen-Image-Edit:\n{qwen_edit_guidance}\n"
+                memory_section += "\nUse these insights to improve prompt generation and avoid common issues.\n"
+                
+                # Add memory guidance to system prompt
+                base_prompt += memory_section
 
             self.logger.info(f"System Prompt for model selection: {base_prompt}")
             self.logger.info(f"User Prompt for model selection: {task_prompt}")
@@ -1641,9 +2073,9 @@ class ModelSelector:
                 )
                 result["negative_prompt"] = neg_result["negative_prompt"]
                 self.logger.info(f"Generated negative prompt: {result['negative_prompt']}")
-
+            
             return result
-
+            
         except Exception as e:
             self.logger.error(f"Error in model selection: {str(e)}. Return basic configuration.")
             # Fallback to Qwen-Image with basic configuration including negative prompt
@@ -1832,7 +2264,7 @@ def intention_understanding_node(state: MessagesState) -> Command[str]:
 
 def model_selection_node(state: MessagesState) -> Command[str]:
     """Process model selection and image generation."""
-    selector = ModelSelector(llm)
+    selector = ModelSelector(llm, memory_manager)
     
     logger.info("-"*50)
     logger.info("INSIDE MODEL SELECTION NODE")
@@ -2244,6 +2676,9 @@ def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, o
 
     # Initialize LLMs based on open_llm flag
     llm, llm_json = initialize_llms(use_open_llm, open_llm_model=open_llm_model, local_host=open_llm_host, local_port=open_llm_port)
+
+    # Initialize memory manager
+    memory_manager = MemoryManager()
 
     # Get workflow
     workflow = create_t2i_workflow()
