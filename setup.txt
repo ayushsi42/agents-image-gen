@@ -17,7 +17,11 @@ conda activate t2i_copilot
 pip install git+https://github.com/huggingface/diffusers
 pip install --upgrade "transformers>=4.44.0"
 pip install bitsandbytes
+conda install -c pytorch faiss-gpu
 
+pip uninstall torch torchvision torchaudio
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 sudo apt-get update
 sudo apt-get install -y build-essential
 

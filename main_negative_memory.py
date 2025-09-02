@@ -8,7 +8,8 @@ import time
 import pickle
 import faiss
 import numpy as np
-from sentence_transformers import SentenceTransformer
+from transformers import AutoModel
+import torch
 
 NODE_MODEL_SELECTION = "model_selection"
 NODE_EVALUATION = "evaluation"
@@ -56,6 +57,9 @@ from tqdm import tqdm
 # Initialize model variables
 qwen_image_pipe = None
 qwen_edit_pipe = None
+
+# Initialize embedding model variable
+embedding_model = None
 
 # Initialize LLM variables
 llm = None
@@ -854,10 +858,17 @@ class MemoryManager:
     
     def _init_rag_system(self):
         """Initialize RAG system with FAISS indices and sentence transformers."""
+        global embedding_model
         try:
-            # Initialize embedding model
-            self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
-            self.logger.info("Initialized sentence transformer model")
+            # Use the global embedding model if available
+            if embedding_model is not None:
+                self.embedding_model = embedding_model
+                self.logger.info("Using global Jina embedding model")
+            else:
+                # Fallback: Initialize embedding model locally
+                self.embedding_model = AutoModel.from_pretrained("jinaai/jina-embeddings-v4", trust_remote_code=True, torch_dtype=torch.float16)
+                self.embedding_model.to("cuda")
+                self.logger.info("Initialized local Jina embedding model (fallback)")
             
             # Initialize/load FAISS indices for each model
             for model_key, index_path in self.rag_db_paths.items():
@@ -901,7 +912,11 @@ class MemoryManager:
                 return
                 
             # Create embedding for the prompt
-            embedding = self.embedding_model.encode([prompt])
+            embedding = self.embedding_model.encode_text(
+                texts=[prompt],
+                task="retrieval",
+                prompt_name="query"
+            )
             norm = np.linalg.norm(embedding)
             if norm > 0:
                 embedding = embedding / norm  # Normalize for cosine similarity
@@ -938,7 +953,11 @@ class MemoryManager:
                 return []
             
             # Create embedding for search prompt
-            query_embedding = self.embedding_model.encode([prompt])
+            query_embedding = self.embedding_model.encode_text(
+                texts=[prompt],
+                task="retrieval",
+                prompt_name="query"
+            )
             query_embedding = query_embedding / np.linalg.norm(query_embedding)
             
             # Search similar entries
@@ -1616,13 +1635,23 @@ def load_models(use_quantization=True):
         use_quantization (bool): Whether to use quantization and FP16 for reduced memory usage.
             If False, models will be loaded in FP32 without quantization for higher precision.
     """
-    global qwen_image_pipe, qwen_edit_pipe
+    global qwen_image_pipe, qwen_edit_pipe, embedding_model
 
     # Clear any existing GPU memory
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     
     try:
+        # Load embedding model first
+        print("Loading Jina embedding model...")
+        embedding_model = AutoModel.from_pretrained(
+            "jinaai/jina-embeddings-v2-small-en", 
+            trust_remote_code=True, 
+            torch_dtype=torch.float16
+        )
+        embedding_model.to("cuda")
+        print("Successfully loaded Jina embedding model")
+        
         if use_quantization:
             
             print("Loading Qwen Image model with quantization...")
@@ -1905,14 +1934,19 @@ class ModelSelector:
     def _create_system_prompt(self) -> str:
         """Create the system prompt with all examples and guidelines."""
         # Get RAG guidance for model selection steps
-        prompt_refinement_guidance = config.workflow_guidance.get("positive_guidance", {}).get("prompt_refinement", "")
-        negative_prompt_guidance = config.workflow_guidance.get("positive_guidance", {}).get("negative_prompt", "")
-        generation_guidance = config.workflow_guidance.get("positive_guidance", {}).get("generation", "")
-        
-        # Get warnings for next steps
-        negative_warnings = config.workflow_guidance.get("negative_warnings", {}).get("negative_prompt", "")
-        polishing_warnings = config.workflow_guidance.get("negative_warnings", {}).get("prompt_polishing", "")
-        generation_warnings = config.workflow_guidance.get("negative_warnings", {}).get("generation", "")
+        try:
+            prompt_refinement_guidance = config.workflow_guidance.get("positive_guidance", {}).get("prompt_refinement", "")
+            negative_prompt_guidance = config.workflow_guidance.get("positive_guidance", {}).get("negative_prompt", "")
+            generation_guidance = config.workflow_guidance.get("positive_guidance", {}).get("generation", "")
+            
+            # Get warnings for next steps
+            negative_warnings = config.workflow_guidance.get("negative_warnings", {}).get("negative_prompt", "")
+            polishing_warnings = config.workflow_guidance.get("negative_warnings", {}).get("prompt_polishing", "")
+            generation_warnings = config.workflow_guidance.get("negative_warnings", {}).get("generation", "")
+        except AttributeError:
+            # Handle case where workflow_guidance doesn't exist
+            prompt_refinement_guidance = negative_prompt_guidance = generation_guidance = ""
+            negative_warnings = polishing_warnings = generation_warnings = ""
         
         # Build RAG guidance text
         rag_guidance_text = ""
@@ -2161,13 +2195,14 @@ class ModelSelector:
 
     def _get_memory_guidance(self, model_name: str) -> str:
         """Get RAG-based guidance for prompt generation."""
+        global config
         if not self.memory_manager:
             return ""
         
         try:
             # Use RAG guidance if available from config
-            if hasattr(self.config, 'workflow_guidance') and self.config.workflow_guidance:
-                guidance = self.config.workflow_guidance.get(f'{model_name.lower()}_guidance', '')
+            if hasattr(config, 'workflow_guidance') and config.workflow_guidance:
+                guidance = config.workflow_guidance.get(f'{model_name.lower()}_guidance', '')
                 if guidance:
                     self.logger.debug(f"Added RAG guidance for {model_name}: {guidance[:200]}...")
                     return f"RAG-BASED GUIDANCE:\n{guidance}"
@@ -2290,8 +2325,11 @@ def intention_understanding_node(state: MessagesState) -> Command[str]:
         logger.info("Step 1: Determining creativity level based on prompt")
         
         # Get RAG guidance for creativity level
-        creativity_guidance = config.workflow_guidance.get("positive_guidance", {}).get("creativity_level", "")
-        creativity_warnings = config.workflow_guidance.get("negative_warnings", {}).get("creativity_level", "")
+        try:
+            creativity_guidance = config.workflow_guidance.get("positive_guidance", {}).get("creativity_level", "")
+            creativity_warnings = config.workflow_guidance.get("negative_warnings", {}).get("creativity_level", "")
+        except AttributeError:
+            creativity_guidance = creativity_warnings = ""
         
         if creativity_guidance:
             logger.info(f"RAG Guidance for Creativity Level: {creativity_guidance}")
@@ -2309,8 +2347,11 @@ def intention_understanding_node(state: MessagesState) -> Command[str]:
         logger.info("Step 2: Analyzing prompt")
         try:
             # Get RAG guidance for intention analysis
-            intention_guidance = config.workflow_guidance.get("positive_guidance", {}).get("intention_analysis", "")
-            intention_warnings = config.workflow_guidance.get("negative_warnings", {}).get("intention_analysis", "")
+            try:
+                intention_guidance = config.workflow_guidance.get("positive_guidance", {}).get("intention_analysis", "")
+                intention_warnings = config.workflow_guidance.get("negative_warnings", {}).get("intention_analysis", "")
+            except AttributeError:
+                intention_guidance = intention_warnings = ""
             
             if intention_guidance:
                 logger.info(f"RAG Guidance for Intention Analysis: {intention_guidance}")
@@ -2337,8 +2378,11 @@ def intention_understanding_node(state: MessagesState) -> Command[str]:
             
             if questions == "SUFFICIENT_DETAIL" or questions == "AUTOCOMPLETE" or not config.is_human_in_loop:
                 # Get RAG guidance for prompt refinement
-                refinement_guidance = config.workflow_guidance.get("positive_guidance", {}).get("prompt_refinement", "")
-                refinement_warnings = config.workflow_guidance.get("negative_warnings", {}).get("prompt_refinement", "")
+                try:
+                    refinement_guidance = config.workflow_guidance.get("positive_guidance", {}).get("prompt_refinement", "")
+                    refinement_warnings = config.workflow_guidance.get("negative_warnings", {}).get("prompt_refinement", "")
+                except AttributeError:
+                    refinement_guidance = refinement_warnings = ""
                 
                 # Refine prompt directly with RAG guidance
                 refinement_result = analyzer.refine_prompt_with_analysis(
@@ -2396,8 +2440,11 @@ def intention_understanding_node(state: MessagesState) -> Command[str]:
                     analysis = json.loads(config.prompt_understanding['prompt_analysis'])
                     
                     # Get RAG guidance for prompt refinement
-                    refinement_guidance = config.workflow_guidance.get("positive_guidance", {}).get("prompt_refinement", "")
-                    refinement_warnings = config.workflow_guidance.get("negative_warnings", {}).get("prompt_refinement", "")
+                    try:
+                        refinement_guidance = config.workflow_guidance.get("positive_guidance", {}).get("prompt_refinement", "")
+                        refinement_warnings = config.workflow_guidance.get("negative_warnings", {}).get("prompt_refinement", "")
+                    except AttributeError:
+                        refinement_guidance = refinement_warnings = ""
                     
                     # Refine prompt with user input and RAG guidance
                     refinement_result = analyzer.refine_prompt_with_analysis(
@@ -2429,8 +2476,11 @@ def intention_understanding_node(state: MessagesState) -> Command[str]:
                 else:
                     # If not human_in_the_loop, proceed with auto-refinement
                     # Get RAG guidance for prompt refinement
-                    refinement_guidance = config.workflow_guidance.get("positive_guidance", {}).get("prompt_refinement", "")
-                    refinement_warnings = config.workflow_guidance.get("negative_warnings", {}).get("prompt_refinement", "")
+                    try:
+                        refinement_guidance = config.workflow_guidance.get("positive_guidance", {}).get("prompt_refinement", "")
+                        refinement_warnings = config.workflow_guidance.get("negative_warnings", {}).get("prompt_refinement", "")
+                    except AttributeError:
+                        refinement_guidance = refinement_warnings = ""
                     
                     refinement_result = analyzer.refine_prompt_with_analysis(
                         last_message.content,
@@ -2649,7 +2699,10 @@ def evaluation_node(state: MessagesState) -> Command[str]:
         current_config = config.get_current_config()
         
         # Prepare evaluation prompt with RAG guidance
-        evaluation_guidance = config.workflow_guidance.get("positive_guidance", {}).get("evaluation", "")
+        try:
+            evaluation_guidance = config.workflow_guidance.get("positive_guidance", {}).get("evaluation", "")
+        except AttributeError:
+            evaluation_guidance = ""
         guidance_text = ""
         if evaluation_guidance:
             guidance_text = f"\n\nRAG GUIDANCE FOR EVALUATION:\n{evaluation_guidance}\n\nConsider this guidance when evaluating the image."
