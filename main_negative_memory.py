@@ -5,8 +5,11 @@ import sqlite3
 import json
 import os
 import time
+import pickle
+import faiss
+import numpy as np
+from sentence_transformers import SentenceTransformer
 
-# Node names
 NODE_MODEL_SELECTION = "model_selection"
 NODE_EVALUATION = "evaluation"
 from datetime import datetime
@@ -45,7 +48,7 @@ from transformers import Qwen2_5_VLForConditionalGeneration
 
 import re
 import json
-from prompts.system_prompts import make_intention_analysis_prompt, make_gen_image_judge_prompt
+from prompts.system_prompts_memory import make_intention_analysis_prompt, make_gen_image_judge_prompt
 
 import time
 from tqdm import tqdm
@@ -53,6 +56,10 @@ from tqdm import tqdm
 # Initialize model variables
 qwen_image_pipe = None
 qwen_edit_pipe = None
+
+# Initialize LLM variables
+llm = None
+llm_json = None
 
 class CreativityLevel(Enum):
     LOW = "low"      # Ask for every unclear element, minimal creative fill
@@ -84,6 +91,15 @@ class T2IConfig:
             "user_clarification": None,
             "refined_prompt": "",
         }
+
+        # RAG-based workflow guidance
+        self.workflow_guidance = {
+            "positive_guidance": {},  # What worked well for similar prompts
+            "negative_warnings": {}   # What to avoid based on similar prompt failures
+        }
+        
+        # RAG guidance retrieval flag
+        self.rag_guidance_retrieved = False
 
         # Initialize first regeneration config as default config
         self.regeneration_count = 0
@@ -290,9 +306,14 @@ class IntentionAnalyzer:
         self.llm_json = llm.bind(response_format={"type": "json_object"})
         self.logger = logger
 
-    def determine_creativity_level(self, prompt: str) -> CreativityLevel:
+    def determine_creativity_level(self, prompt: str, rag_guidance: str = "") -> CreativityLevel:
         """Analyze the prompt to automatically determine the appropriate creativity level."""
         self.logger.debug(f"Determining creativity level for prompt: '{prompt}'")
+        
+        # Include RAG guidance in the analysis prompt
+        rag_guidance_text = ""
+        if rag_guidance:
+            rag_guidance_text = f"\n\nRAG GUIDANCE FOR CREATIVITY LEVEL:\n{rag_guidance}\n\nConsider this guidance when determining the creativity level."
         
         creativity_analysis_prompt = """You are an expert at analyzing image generation prompts to determine the appropriate creativity level.
 
@@ -316,7 +337,7 @@ LOW Creativity Level (stick closely to specifications):
 - Technical or precise requests (e.g., "headshot photo", "product photography")
 - Prompts with explicit style, composition, and detail specifications
 - Professional or commercial image requests
-- Prompts that leave little room for interpretation
+- Prompts that leave little room for interpretation""" + rag_guidance_text + """
 
 Return JSON with:
 {
@@ -410,9 +431,16 @@ Output: {
         self.logger.debug("No valid image file or URL found in the prompt.")
         return None, None
 
-    def analyze_prompt(self, prompt: str, creativity_level: CreativityLevel) -> Dict[str, Any]:
+    def analyze_prompt(self, prompt: str, creativity_level: CreativityLevel, rag_guidance: str = "", next_step_warnings: str = "") -> Dict[str, Any]:
         """Analyze the prompt and identify elements that need clarification."""
         self.logger.debug(f"Analyzing prompt: '{prompt}' with creativity level: {creativity_level.value}")
+        
+        # Prepare guidance text
+        guidance_text = ""
+        if rag_guidance:
+            guidance_text += f"\n\nRAG GUIDANCE FOR INTENTION ANALYSIS:\n{rag_guidance}"
+        if next_step_warnings:
+            guidance_text += f"\n\nWARNINGS FOR NEXT STEP (Prompt Refinement):\n{next_step_warnings}\nConsider these potential issues when analyzing the prompt."
         
         # Identify image input by ".png" or ".jpg"
         # NOTE: currently only support one image (the first identified image) in the prompt
@@ -423,7 +451,7 @@ Output: {
                 analysis_prompt = [
                                     (
                                         "system",
-                                        make_intention_analysis_prompt()
+                                        make_intention_analysis_prompt() + guidance_text
                                     ),
                                     (
                                         "human",
@@ -443,7 +471,7 @@ Output: {
                     analysis_prompt = [
                                     (
                                         "system",
-                                        make_intention_analysis_prompt()
+                                        make_intention_analysis_prompt() + guidance_text
                                     ),
                                     (
                                         "human",
@@ -459,7 +487,7 @@ Output: {
             analysis_prompt = [
                 (
                     "system",
-                    make_intention_analysis_prompt()
+                    make_intention_analysis_prompt() + guidance_text
                 ),
                 (
                     "human",
@@ -539,7 +567,9 @@ Output: {
                                     original_prompt: str, 
                                     analysis: Dict[str, Any], 
                                     user_responses: Optional[Dict[str, str]] = None,
-                                    creativity_level: CreativityLevel = CreativityLevel.MEDIUM
+                                    creativity_level: CreativityLevel = CreativityLevel.MEDIUM,
+                                    rag_guidance: str = "",
+                                    next_step_warnings: str = ""
                                 ) -> Dict[str, Any]:
         """
         Refine the prompt using the analysis and any user responses.
@@ -553,13 +583,22 @@ Output: {
         self.logger.debug(f"Original prompt: '{original_prompt}'")
         self.logger.debug(f"User responses: {user_responses}")
         self.logger.debug(f"Creativity level: {creativity_level.value}")
+        self.logger.debug(f"RAG guidance: {rag_guidance}")
+        self.logger.debug(f"Next step warnings: {next_step_warnings}")
+        
+        # Prepare RAG guidance text
+        guidance_text = ""
+        if rag_guidance:
+            guidance_text += f"\n\nRAG GUIDANCE FOR PROMPT REFINEMENT:\n{rag_guidance}\nUse this guidance to improve the refinement process."
+        if next_step_warnings:
+            guidance_text += f"\n\nWARNINGS FOR NEXT STEP (Negative Prompt Generation):\n{next_step_warnings}\nKeep these potential issues in mind when refining the prompt."
         
         if user_responses:
             refinement_prompt = f"""
             Original prompt: "{original_prompt}"
             Analysis: {json.dumps(analysis, indent=2)}
             User responses: {json.dumps(user_responses, indent=2)}
-            Current creativity level: {creativity_level.value}
+            Current creativity level: {creativity_level.value}{guidance_text}
             
             You are a Qwen-Image prompt expert. Your PRIMARY GOAL is to stay faithful to the original prompt while incorporating user clarifications. CRITICAL: The refined prompt must preserve the core intent, subjects, and atmosphere of the original prompt.
             
@@ -598,7 +637,7 @@ Output: {
             refinement_prompt = f"""
             Original prompt: "{original_prompt}"
             Analysis: {json.dumps(analysis, indent=2)}
-            Creativity level: {creativity_level.value}
+            Creativity level: {creativity_level.value}{guidance_text}
 
             You are a Qwen prompt expert. Your PRIMARY GOAL is to stay faithful to the original prompt while resolving ambiguities. CRITICAL: The refined prompt must preserve the core intent, subjects, and atmosphere of the original prompt.
             
@@ -733,12 +772,22 @@ Consider the scene type, style, and content to determine what should be avoided.
 
 
 class MemoryManager:
-    """Manages global memory for model performance analysis using SQLite."""
+    """Manages global memory for model performance analysis using SQLite and RAG DB with FAISS."""
     
     def __init__(self, db_path: str = "model_memory.db", pattern_extraction_frequency: int = 10, logger=None):
         self.db_path = db_path
         self.pattern_extraction_frequency = pattern_extraction_frequency
         self.logger = logger
+        
+        # RAG DB components
+        self.embedding_model = None
+        self.rag_indices = {}  # Separate FAISS indices for each model
+        self.rag_data = {}     # Store metadata for each model
+        self.rag_db_paths = {
+            "qwen_image": "rag_qwen_image.index",
+            "qwen_image_edit": "rag_qwen_image_edit.index"
+        }
+        
         if self.logger is None:
             # Create a simple logger if none provided
             import logging
@@ -749,7 +798,9 @@ class MemoryManager:
                 handler.setFormatter(formatter)
                 self.logger.addHandler(handler)
                 self.logger.setLevel(logging.INFO)
+        
         self._init_database()
+        self._init_rag_system()
     
     def _init_database(self):
         """Initialize SQLite database with tables for each model."""
@@ -794,34 +845,6 @@ class MemoryManager:
                 )
             ''')
             
-            # Table for Qwen-Image local memory (extracted patterns)
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS qwen_image_local_memory (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp TEXT NOT NULL,
-                    extraction_run_count INTEGER,
-                    successful_prompt_patterns TEXT,
-                    common_good_practices TEXT,
-                    common_bad_patterns TEXT,
-                    refinement_strategies TEXT,
-                    pattern_summary TEXT
-                )
-            ''')
-            
-            # Table for Qwen-Image-Edit local memory (extracted patterns)
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS qwen_image_edit_local_memory (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp TEXT NOT NULL,
-                    extraction_run_count INTEGER,
-                    successful_prompt_patterns TEXT,
-                    common_good_practices TEXT,
-                    common_bad_patterns TEXT,
-                    refinement_strategies TEXT,
-                    pattern_summary TEXT
-                )
-            ''')
-            
             conn.commit()
             conn.close()
             self.logger.debug(f"Initialized memory database at: {self.db_path}")
@@ -829,65 +852,329 @@ class MemoryManager:
         except Exception as e:
             self.logger.error(f"Failed to initialize memory database: {str(e)}")
     
-    def _generate_process_summary(self, config_data: Dict[str, Any]) -> str:
-        """Generate a comprehensive summary of the entire workflow process."""
+    def _init_rag_system(self):
+        """Initialize RAG system with FAISS indices and sentence transformers."""
         try:
-            summary_parts = []
+            # Initialize embedding model
+            self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+            self.logger.info("Initialized sentence transformer model")
             
-            # Process overview
-            summary_parts.append("=== IMAGE GENERATION WORKFLOW SUMMARY ===")
+            # Initialize/load FAISS indices for each model
+            for model_key, index_path in self.rag_db_paths.items():
+                if os.path.exists(index_path) and os.path.exists(f"{index_path}.metadata"):
+                    # Load existing index
+                    self.rag_indices[model_key] = faiss.read_index(index_path)
+                    with open(f"{index_path}.metadata", 'rb') as f:
+                        self.rag_data[model_key] = pickle.load(f)
+                    self.logger.info(f"Loaded existing RAG index for {model_key}")
+                else:
+                    # Create new index
+                    dimension = 384  # all-MiniLM-L6-v2 embedding dimension
+                    self.rag_indices[model_key] = faiss.IndexFlatIP(dimension)  # Inner product for cosine similarity
+                    self.rag_data[model_key] = []
+                    self.logger.info(f"Created new RAG index for {model_key}")
+                    
+        except Exception as e:
+            self.logger.error(f"Failed to initialize RAG system: {str(e)}")
+            # Fallback - create empty indices
+            self.rag_indices = {"qwen_image": None, "qwen_image_edit": None}
+            self.rag_data = {"qwen_image": [], "qwen_image_edit": []}
+    
+    def _save_rag_index(self, model_key: str):
+        """Save FAISS index and metadata to disk."""
+        try:
+            if model_key in self.rag_indices and self.rag_indices[model_key] is not None:
+                index_path = self.rag_db_paths[model_key]
+                faiss.write_index(self.rag_indices[model_key], index_path)
+                with open(f"{index_path}.metadata", 'wb') as f:
+                    pickle.dump(self.rag_data[model_key], f)
+                self.logger.debug(f"Saved RAG index for {model_key}")
+        except Exception as e:
+            self.logger.error(f"Failed to save RAG index for {model_key}: {str(e)}")
+    
+    def _update_rag_index(self, model_key: str, prompt: str, analysis_data: Dict[str, Any]):
+        """Add new entry to RAG index."""
+        try:
+            if (self.embedding_model is None or 
+                model_key not in self.rag_indices or 
+                self.rag_indices[model_key] is None):
+                return
+                
+            # Create embedding for the prompt
+            embedding = self.embedding_model.encode([prompt])
+            norm = np.linalg.norm(embedding)
+            if norm > 0:
+                embedding = embedding / norm  # Normalize for cosine similarity
+            else:
+                self.logger.warning(f"Zero-norm embedding for prompt: {prompt[:50]}...")
+                return  # Skip adding zero embeddings
             
-            # Initial prompt understanding
-            prompt_understanding = config_data.get("prompt_understanding", {})
-            summary_parts.append(f"\n1. PROMPT UNDERSTANDING:")
-            summary_parts.append(f"   - Original Prompt: {prompt_understanding.get('original_prompt', 'N/A')}")
-            summary_parts.append(f"   - Creativity Level: {prompt_understanding.get('creativity_level', 'N/A')}")
-            summary_parts.append(f"   - Refined Prompt: {prompt_understanding.get('refined_prompt', 'N/A')}")
+            # Add to FAISS index
+            self.rag_indices[model_key].add(embedding.astype('float32'))
             
-            # Analysis details
-            if prompt_understanding.get('prompt_analysis'):
-                analysis = prompt_understanding['prompt_analysis']
+            # Store metadata
+            self.rag_data[model_key].append({
+                'prompt': prompt,
+                'analysis': analysis_data,
+                'timestamp': datetime.now().isoformat()
+            })
+            
+            # Save to disk periodically
+            if len(self.rag_data[model_key]) % 10 == 0:
+                self._save_rag_index(model_key)
+                
+        except Exception as e:
+            self.logger.error(f"Failed to update RAG index for {model_key}: {str(e)}")
+    
+    def search_similar_prompts(self, prompt: str, model_type: str = "qwen_image", top_k: int = 5) -> List[Dict[str, Any]]:
+        """Search for similar prompts in RAG database and return guidance."""
+        try:
+            model_key = model_type  # Already in correct format from main workflow
+            
+            if (self.embedding_model is None or 
+                model_key not in self.rag_indices or 
+                self.rag_indices[model_key] is None or
+                len(self.rag_data[model_key]) == 0):
+                return []
+            
+            # Create embedding for search prompt
+            query_embedding = self.embedding_model.encode([prompt])
+            query_embedding = query_embedding / np.linalg.norm(query_embedding)
+            
+            # Search similar entries
+            k = min(top_k, len(self.rag_data[model_key]))
+            if k == 0:
+                return []
+                
+            scores, indices = self.rag_indices[model_key].search(query_embedding.astype('float32'), k)
+            
+            # Return similar entries with scores
+            similar_entries = []
+            for i, (score, idx) in enumerate(zip(scores[0], indices[0])):
+                if idx != -1 and idx < len(self.rag_data[model_key]):
+                    entry = self.rag_data[model_key][idx].copy()
+                    entry['similarity_score'] = float(score)
+                    similar_entries.append(entry)
+            
+            return similar_entries
+            
+        except Exception as e:
+            self.logger.error(f"Failed to search similar prompts: {str(e)}")
+            return []
+    
+    def get_workflow_guidance(self, prompt: str, model_type: str = "qwen_image") -> Dict[str, Dict[str, str]]:
+        """Get workflow guidance based on similar prompts from RAG DB."""
+        try:
+            similar_prompts = self.search_similar_prompts(prompt, model_type, top_k=5)
+            
+            if not similar_prompts:
+                self.logger.info(f"No similar prompts found for: {prompt[:50]}...")
+                return {
+                    "positive_guidance": {
+                        "creativity_level": "",
+                        "intention_analysis": "",
+                        "prompt_refinement": "",
+                        "negative_prompt": "",
+                        "prompt_polishing": "",
+                        "generation": "",
+                        "evaluation": ""
+                    },
+                    "negative_warnings": {
+                        "creativity_level": "",
+                        "intention_analysis": "",
+                        "prompt_refinement": "",
+                        "negative_prompt": "",
+                        "prompt_polishing": "",
+                        "generation": ""
+                    }
+                }
+            
+            self.logger.info(f"Found {len(similar_prompts)} similar prompts for guidance generation")
+            
+            # Extract insights from similar prompts
+            return self._analyze_similar_prompts_for_guidance(similar_prompts)
+            
+        except Exception as e:
+            self.logger.error(f"Failed to get workflow guidance: {str(e)}")
+            return {
+                "positive_guidance": {
+                    "creativity_level": "",
+                    "intention_analysis": "",
+                    "prompt_refinement": "",
+                    "negative_prompt": "",
+                    "prompt_polishing": "",
+                    "generation": "",
+                    "evaluation": ""
+                },
+                "negative_warnings": {
+                    "creativity_level": "",
+                    "intention_analysis": "",
+                    "prompt_refinement": "",
+                    "negative_prompt": "",
+                    "prompt_polishing": "",
+                    "generation": ""
+                }
+            }
+    
+    def _analyze_similar_prompts_for_guidance(self, similar_prompts: List[Dict[str, Any]]) -> Dict[str, Dict[str, str]]:
+        """Analyze similar prompts to extract workflow guidance using LLM."""
+        global llm_json
+        
+        try:
+            # Prepare data from similar prompts
+            analysis_data = []
+            for entry in similar_prompts:
+                prompt = entry.get('prompt', '')
+                analysis = entry.get('analysis', {})
+                similarity = entry.get('similarity_score', 0)
+                
+                # Parse analysis if it's a JSON string
                 if isinstance(analysis, str):
                     try:
                         analysis = json.loads(analysis)
                     except:
-                        pass
+                        continue
+                
                 if isinstance(analysis, dict):
-                    summary_parts.append(f"   - Identified Elements: {analysis.get('identified_elements', {})}")
-                    summary_parts.append(f"   - Ambiguous Elements: {len(analysis.get('ambiguous_elements', []))} items")
+                    good_things = analysis.get('good_things', {})
+                    bad_things = analysis.get('bad_things', {})
+                    
+                    analysis_data.append({
+                        'prompt': prompt,
+                        'similarity': similarity,
+                        'good_things': good_things,
+                        'bad_things': bad_things
+                    })
             
-            # Regeneration attempts
-            regen_configs = config_data.get("regeneration_configs", {})
+            if not analysis_data:
+                return {"positive_guidance": {}, "negative_warnings": {}}
+            
+            # Create prompt for LLM analysis
+            similar_data_text = "\n".join([
+                f"Similarity: {entry['similarity']:.3f} | Prompt: '{entry['prompt']}'\n"
+                f"Good: {json.dumps(entry['good_things'], indent=2)}\n"
+                f"Bad: {json.dumps(entry['bad_things'], indent=2)}\n"
+                for entry in analysis_data
+            ])
+            
+            guidance_prompt = f"""Based on the analysis of similar prompts, extract workflow guidance for the new prompt.
+
+SIMILAR PROMPTS DATA:
+{similar_data_text}
+
+Extract specific guidance for each workflow step. For positive guidance, identify what worked well for similar prompts. For negative warnings, identify what commonly failed so the previous step can prepare accordingly.
+
+WORKFLOW STEPS:
+1. Creativity Level → 2. Intention Analysis → 3. Prompt Refinement → 4. Negative Prompt → 5. Prompt Polishing → 6. Generation → 7. Evaluation
+
+THEORY OF MIND APPLICATION:
+- Positive guidance goes to the step itself
+- Negative warnings go to the PREVIOUS step to prepare for the next step's weaknesses
+
+Return JSON format:
+{{
+    "positive_guidance": {{
+        "creativity_level": "What creativity level approaches worked well for similar prompts",
+        "intention_analysis": "What intention analysis techniques were successful", 
+        "prompt_refinement": "What refinement approaches produced good results",
+        "negative_prompt": "What negative prompt strategies were effective",
+        "prompt_polishing": "What polishing techniques improved generation quality",
+        "generation": "What generation approaches worked well",
+        "evaluation": "What evaluation insights were accurate"
+    }},
+    "negative_warnings": {{
+        "creativity_level": "Warning: Intention Analysis often struggles with X for similar prompts",
+        "intention_analysis": "Warning: Prompt Refinement tends to fail at Y for similar prompts",
+        "prompt_refinement": "Warning: Negative Prompt generation often misses Z for similar prompts", 
+        "negative_prompt": "Warning: Prompt Polishing commonly fails at A for similar prompts",
+        "prompt_polishing": "Warning: Generation often produces B issues for similar prompts",
+        "generation": "Warning: Evaluation often misses C problems for similar prompts"
+    }}
+}}
+
+Focus on actionable, specific guidance based on the patterns in similar prompts."""
+
+            response = llm_json.invoke([
+                ("system", "You are an expert at analyzing patterns in image generation workflows to provide actionable guidance."),
+                ("human", guidance_prompt)
+            ])
+            
+            if isinstance(response.content, str):
+                result = json.loads(response.content)
+            else:
+                result = response.content
+                
+            return result
+            
+        except Exception as e:
+            self.logger.error(f"Failed to analyze similar prompts for guidance: {str(e)}")
+            return {
+                "positive_guidance": {
+                    "creativity_level": "",
+                    "intention_analysis": "",
+                    "prompt_refinement": "",
+                    "negative_prompt": "",
+                    "prompt_polishing": "",
+                    "generation": "",
+                    "evaluation": ""
+                },
+                "negative_warnings": {
+                    "creativity_level": "",
+                    "intention_analysis": "",
+                    "prompt_refinement": "",
+                    "negative_prompt": "",
+                    "prompt_polishing": "",
+                    "generation": ""
+                }
+            }
+    
+    def _generate_process_summary(self, config_data: Dict[str, Any]) -> str:
+        """Generate an explanation of how each step in the image generation workflow works."""
+        try:
+            # Extract key information for workflow explanation
+            prompt_understanding = config_data.get("prompt_understanding", {})
+            original_prompt = prompt_understanding.get('original_prompt', 'N/A')
+            creativity_level = prompt_understanding.get('creativity_level', 'medium')
             regen_count = config_data.get("regeneration_count", 0)
-            summary_parts.append(f"\n2. GENERATION ATTEMPTS: {regen_count + 1} total")
             
-            for i in range(regen_count + 1):
-                config_key = f"count_{i}"
-                if config_key in regen_configs:
-                    regen_config = regen_configs[config_key]
-                    attempt_num = i + 1
-                    summary_parts.append(f"\n   Attempt {attempt_num}:")
-                    summary_parts.append(f"   - Selected Model: {regen_config.get('selected_model', 'N/A')}")
-                    summary_parts.append(f"   - Model Selection Reasoning: {regen_config.get('reasoning', 'N/A')}")
-                    summary_parts.append(f"   - Confidence Score: {regen_config.get('confidence_score', 'N/A')}")
-                    summary_parts.append(f"   - Generating Prompt: {regen_config.get('generating_prompt', 'N/A')}")
-                    summary_parts.append(f"   - Negative Prompt: {regen_config.get('negative_prompt', 'N/A')}")
-                    summary_parts.append(f"   - Evaluation Score: {regen_config.get('evaluation_score', 'N/A')}")
-                    summary_parts.append(f"   - Generated Image: {regen_config.get('gen_image_path', 'N/A')}")
-                    if regen_config.get('reference_content_image'):
-                        summary_parts.append(f"   - Reference Image: {regen_config.get('reference_content_image', 'N/A')}")
-                    if regen_config.get('improvement_suggestions'):
-                        summary_parts.append(f"   - Improvement Suggestions: {regen_config.get('improvement_suggestions', 'N/A')}")
+            # Parse prompt analysis if available
+            prompt_analysis = prompt_understanding.get('prompt_analysis', {})
+            if isinstance(prompt_analysis, str):
+                try:
+                    prompt_analysis = json.loads(prompt_analysis)
+                except:
+                    prompt_analysis = {}
             
-            # Configuration details
-            summary_parts.append(f"\n3. SYSTEM CONFIGURATION:")
-            summary_parts.append(f"   - Human in Loop: {config_data.get('is_human_in_loop', 'N/A')}")
-            summary_parts.append(f"   - Seed: {config_data.get('seed', 'N/A')}")
-            summary_parts.append(f"   - Open LLM Used: {config_data.get('use_open_llm', 'N/A')}")
-            if config_data.get('use_open_llm'):
-                summary_parts.append(f"   - LLM Model: {config_data.get('open_llm_model', 'N/A')}")
-            
-            return "\n".join(summary_parts)
+            # Build workflow step explanations in execution order
+            summary = f"""IMAGE GENERATION WORKFLOW EXECUTION EXPLANATION:
+
+1. CREATIVITY LEVEL DETERMINATION:
+The system analyzed the user prompt "{original_prompt}" and determined a {creativity_level} creativity level. This controls how the system handles ambiguous or missing details - {creativity_level} level means the system {'asks for clarification on most unclear elements before proceeding' if creativity_level == 'low' else 'balances autonomous interpretation with strategic user clarification for important details' if creativity_level == 'medium' else 'autonomously fills in most missing details using contextual reasoning'}.
+
+2. INTENTION ANALYSIS:
+The system performed deep semantic analysis to understand the user's intent behind the prompt. It identified {len(prompt_analysis.get('identified_elements', {}))} specific visual elements (objects, styles, composition details) and detected {len(prompt_analysis.get('ambiguous_elements', []))} ambiguous aspects that needed interpretation. This analysis determines what questions to ask and how to structure the image generation approach.
+
+3. PROMPT REFINEMENT:
+Based on the intention analysis, the system {'refined the original prompt by clarifying ambiguous elements and adding contextual details' if prompt_understanding.get('refined_prompt') != original_prompt else 'determined the original prompt was sufficiently clear and required minimal refinement'}. The refined prompt: "{prompt_understanding.get('refined_prompt', 'N/A')}" serves as the foundation for all subsequent generation steps.
+
+4. NEGATIVE PROMPT CREATION:
+For each generation attempt, the system analyzes potential unwanted artifacts and creates targeted negative prompts to avoid common issues like blurriness, distortion, low quality, or inappropriate content. This step identifies what NOT to generate based on the prompt requirements and model characteristics.
+
+5. PROMPT POLISHING:
+The system then optimizes the generating prompt specifically for the target model's architecture and training patterns. This involves adjusting language, adding technical keywords, and structuring the prompt to maximize the model's understanding and output quality.
+
+6. GENERATION:
+The system selects the most appropriate model based on prompt requirements and generates the image using the polished prompts and negative constraints. Model selection considers factors like artistic style needs, technical requirements, and reference image usage.
+
+7. EVALUATION:
+Each generated image undergoes automated evaluation analyzing prompt adherence, visual quality, technical execution, and artistic merit. The evaluation produces quantitative scores and qualitative feedback to guide potential improvements.
+
+8. REGENERATION PROCESS:
+{'The workflow completed in a single generation cycle with satisfactory results.' if regen_count == 0 else f'The system performed {regen_count} additional generation cycles, each time analyzing the previous results and adjusting the approach based on evaluation feedback and user input. Each regeneration cycle refines model selection, prompt optimization, and generation parameters.'}
+
+This workflow ensures systematic optimization from initial prompt understanding through final image delivery."""
+
+            return summary
             
         except Exception as e:
             self.logger.error(f"Failed to generate process summary: {str(e)}")
@@ -897,47 +1184,121 @@ class MemoryManager:
         """Use LLM to analyze model performance and extract good/bad things, including visual analysis of generated images."""
         global llm_json
         
+        # Extract relevant config information in structured format
+        prompt_understanding = config_data.get("prompt_understanding", {})
+        
+        # Create structured config context (not full JSON dump)
+        config_context = {
+            "prompt_details": {
+                "original": prompt_understanding.get('original_prompt', 'N/A'),
+                "refined": prompt_understanding.get('refined_prompt', 'N/A'),
+                "creativity_level": prompt_understanding.get('creativity_level', 'N/A')
+            },
+            "model_selection": {
+                "chosen_model": regen_config.get('selected_model', 'N/A'),
+                "selection_reasoning": regen_config.get('reasoning', 'N/A'),
+                "confidence_score": regen_config.get('confidence_score', 'N/A')
+            },
+            "generation_params": {
+                "generating_prompt": regen_config.get('generating_prompt', 'N/A'),
+                "negative_prompt": regen_config.get('negative_prompt', 'N/A'),
+                "seed": config_data.get('seed', 'N/A'),
+                "has_reference_image": bool(regen_config.get('reference_content_image'))
+            },
+            "evaluation_metrics": {
+                "evaluation_score": regen_config.get('evaluation_score', 'N/A'),
+                "user_feedback": regen_config.get('user_feedback', 'N/A'),
+                "improvement_suggestions": regen_config.get('improvement_suggestions', 'N/A')
+            },
+            "system_context": {
+                "human_in_loop": config_data.get('is_human_in_loop', False),
+                "total_attempts": config_data.get('regeneration_count', 0) + 1,
+                "current_attempt": regen_config.get('attempt_number', 1)
+            }
+        }
+        
         # Prepare the message content for the LLM
         message_content = []
         
-        # Add the text analysis part
-        analysis_text = f"""You are an expert AI model performance analyst. Analyze the following image generation workflow and extract insights about the {model_name} model's performance.
+        # Add the text analysis part with structured information
+        analysis_text = f"""You are an expert AI model performance analyst. Analyze the {model_name} model's performance in this image generation task.
 
-WORKFLOW SUMMARY:
+WORKFLOW EXECUTION EXPLANATION:
 {process_summary}
 
-DETAILED CONFIG DATA:
-{json.dumps(config_data, indent=2)}
+EXECUTION-SPECIFIC DATA (in workflow sequence):
 
-CURRENT MODEL GENERATION CONFIG:
-{json.dumps(regen_config, indent=2)}
+CREATIVITY LEVEL SETTING:
+• Level: {config_context['prompt_details']['creativity_level']}
+• Impact: Determined how autonomously the system handled ambiguous prompt elements
 
-Please analyze this specific model's performance considering:
-1. Model Selection Reasoning: Why was this model chosen? Was it appropriate?
-2. Confidence Scores: How confident was the system in the model choice?
-3. Evaluation Scores: How well did the model perform according to automated evaluation?
-4. Prompt Handling: How well did the model handle the given prompt complexity?
-5. Reference Image Usage: (For Qwen-Image-Edit) How well did it utilize reference images?
-6. Generation Quality: Based on evaluation scores, feedback, AND visual analysis of the actual generated image
-7. Visual Coherence: Composition, color harmony, detail quality, prompt adherence
-8. Technical Quality: Resolution, clarity, artifacts, overall image quality
+INTENTION ANALYSIS RESULTS:
+• Original prompt: "{config_context['prompt_details']['original']}"
+• Analysis findings: System identified visual elements and ambiguous aspects requiring interpretation
 
-IMPORTANT: You will see the actual generated image(s) below. Use visual analysis to provide specific insights about:
-- How well the image matches the original prompt
-- Visual quality and technical execution
-- Artistic composition and aesthetic appeal
-- Any visual artifacts or issues
-- Comparison with reference image (for edit tasks)
+PROMPT REFINEMENT OUTPUT:
+• Refined prompt: "{config_context['prompt_details']['refined']}"
+• Refinement quality: {'Significant refinement applied' if config_context['prompt_details']['original'] != config_context['prompt_details']['refined'] else 'Minimal refinement needed'}
 
-Extract and categorize insights into good and bad aspects. Be specific and actionable, referencing what you see in the image(s).
+NEGATIVE PROMPT CREATION:
+• Negative prompt applied: "{config_context['generation_params']['negative_prompt']}"
+• Purpose: Targeted prevention of unwanted artifacts and quality issues
 
-Return a JSON response with:
+PROMPT POLISHING:
+• Final generating prompt: "{config_context['generation_params']['generating_prompt']}"
+• Optimization: Model-specific tuning for {config_context['model_selection']['chosen_model']}
+
+GENERATION EXECUTION:
+• Selected model: {config_context['model_selection']['chosen_model']}
+• Selection reasoning: {config_context['model_selection']['selection_reasoning']}
+• System confidence: {config_context['model_selection']['confidence_score']}/10
+• Reference image used: {'Yes' if config_context['generation_params']['has_reference_image'] else 'No'}
+• Generation seed: {config_context['generation_params']['seed']}
+
+EVALUATION RESULTS:
+• Automated score: {config_context['evaluation_metrics']['evaluation_score']}/10
+• User feedback: {config_context['evaluation_metrics']['user_feedback'] or 'None provided'}
+
+REGENERATION STATUS:
+• Current attempt: #{config_context['system_context']['current_attempt']} of {config_context['system_context']['total_attempts']} total
+• Improvement suggestions: {config_context['evaluation_metrics']['improvement_suggestions'] or 'None from previous cycles'}
+• Human oversight: {'Enabled' if config_context['system_context']['human_in_loop'] else 'Autonomous operation'}
+
+ANALYSIS REQUIREMENTS:
+Analyze this model's performance considering the execution flow:
+1. How well did the model respond to the creativity level and prompt refinement quality?
+2. Effectiveness of negative prompt in preventing unwanted artifacts
+3. Quality of prompt polishing for this specific model's characteristics
+4. Model selection appropriateness based on the refined prompt requirements
+5. Technical execution quality visible in the generated image
+6. Prompt adherence and creative interpretation balance
+7. Reference image utilization (if applicable)
+
+IMPORTANT: You will see the actual generated image(s) below. Provide specific visual analysis referencing the execution context.
+
+Return a JSON response with detailed breakdown by workflow steps:
 {{
-    "good_things": "Detailed description of what the model did well, specific visual strengths observed, successful aspects of the generation process based on actual image analysis",
-    "bad_things": "Detailed description of visual issues, technical weaknesses, areas for improvement, specific problems you can see in the generated image"
+    "good_things": {{
+        "creativity_level": "How well the creativity level setting worked for this prompt and model",
+        "intention_analysis": "Effectiveness of the intention analysis in guiding the process", 
+        "prompt_refinement": "Quality and appropriateness of the prompt refinement",
+        "negative_prompt": "How well the negative prompt prevented unwanted artifacts",
+        "prompt_polishing": "Effectiveness of model-specific prompt optimization",
+        "generation": "Model selection appropriateness and generation quality",
+        "evaluation": "Accuracy of evaluation scoring relative to visual quality"
+    }},
+    "bad_things": {{
+        "creativity_level": "Issues with creativity level setting for this prompt type",
+        "intention_analysis": "Missed elements or incorrect analysis in intention phase",
+        "prompt_refinement": "Problems with refined prompt quality or completeness", 
+        "negative_prompt": "Artifacts that negative prompt failed to prevent",
+        "prompt_polishing": "Poor model-specific optimization or prompt structure",
+        "generation": "Model selection issues or generation quality problems",
+        "evaluation": "Evaluation inaccuracies or scoring misalignment"
+    }}
 }}
 
-Focus on actionable insights that could help improve future model selection and parameter tuning."""
+Focus on specific observations from the actual generated image and how each workflow step contributed to or detracted from the final result."""
 
         message_content.append({
             "type": "text",
@@ -1012,234 +1373,32 @@ Focus on actionable insights that could help improve future model selection and 
             ("human", message_content)
         ])
         
-        if isinstance(response.content, str):
-            result = json.loads(response.content)
-        elif isinstance(response.content, dict):
-            result = response.content
-        else:
-            raise ValueError(f"Unexpected response type: {type(response.content)}")
+        try:
+            if isinstance(response.content, str):
+                result = json.loads(response.content)
+            elif isinstance(response.content, dict):
+                result = response.content
+            else:
+                raise ValueError(f"Unexpected response type: {type(response.content)}")
+        except (json.JSONDecodeError, ValueError) as e:
+            self.logger.error(f"Failed to parse model performance analysis JSON: {str(e)}")
+            self.logger.error(f"Raw response: {response.content}")
+            # Fallback analysis data
+            result = {
+                "good_things": "Unable to parse analysis response - manual review recommended",
+                "bad_things": "JSON parsing failed for model performance analysis"
+            }
         
         self.logger.debug(f"Model analysis for {model_name}: {result}")
         return result
     
-    def _extract_patterns_from_global_memory(self, model_name: str) -> Dict[str, str]:
-        """Extract patterns from global memory using LLM analysis."""
-        try:
-            # Determine table name
-            table_name = f"{model_name.lower().replace('-', '_')}_memory"
-            
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            # Get recent high-scoring entries for pattern analysis
-            cursor.execute(f'''
-                SELECT original_prompt, refined_prompt, evaluation_score, good_things, bad_things, process_summary
-                FROM {table_name}
-                WHERE evaluation_score >= 7.0
-                ORDER BY timestamp DESC
-                LIMIT 50
-            ''')
-            high_score_entries = cursor.fetchall()
-            
-            # Get all entries for broader pattern analysis
-            cursor.execute(f'''
-                SELECT original_prompt, refined_prompt, evaluation_score, good_things, bad_things
-                FROM {table_name}
-                ORDER BY timestamp DESC
-                LIMIT 100
-            ''')
-            all_entries = cursor.fetchall()
-            
-            conn.close()
-            
-            if len(all_entries) < 5:  # Need minimum data for pattern extraction
-                return {
-                    "successful_prompt_patterns": "Insufficient data for pattern extraction",
-                    "common_good_practices": "Insufficient data for pattern extraction", 
-                    "common_bad_patterns": "Insufficient data for pattern extraction",
-                    "refinement_strategies": "Insufficient data for pattern extraction",
-                    "pattern_summary": "Need more runs to extract meaningful patterns"
-                }
-            
-            # Prepare data for LLM analysis
-            high_score_data = "\n".join([
-                f"Score: {entry[2]}, Original: '{entry[0]}', Refined: '{entry[1]}', Good: {entry[3]}, Bad: {entry[4]}"
-                for entry in high_score_entries[:20]  # Limit for token efficiency
-            ])
-            
-            all_scores_summary = f"Total entries: {len(all_entries)}, High scores (>=7.0): {len(high_score_entries)}"
-            
-            # LLM prompt for pattern extraction
-            pattern_extraction_prompt = f"""You are an expert at analyzing image generation patterns to extract actionable insights.
-
-Analyze the following {model_name} performance data and extract patterns that can improve future generations:
-
-=== HIGH SCORING ENTRIES (Score >= 7.0) ===
-{high_score_data}
-
-=== SUMMARY ===
-{all_scores_summary}
-
-Extract the following patterns as concise, actionable text summaries:
-
-1. SUCCESSFUL PROMPT PATTERNS: What characteristics do high-scoring prompts share? (style keywords, structure, specificity level, etc.)
-
-2. COMMON GOOD PRACTICES: What "good things" appear frequently in successful generations? Focus on elements that should be encouraged.
-
-3. COMMON BAD PATTERNS: What problems or "bad things" appear frequently? Focus on what should be avoided.
-
-4. REFINEMENT STRATEGIES: What refinement approaches lead to better results? How are prompts successfully improved?
-
-Keep each section under 100 words and focus on actionable insights that can guide future prompt generation.
-
-Return JSON format:
-{{
-    "successful_prompt_patterns": "text summary",
-    "common_good_practices": "text summary", 
-    "common_bad_patterns": "text summary",
-    "refinement_strategies": "text summary",
-    "pattern_summary": "brief overall insight summary"
-}}"""
-
-            # Use LLM to extract patterns
-            llm_with_json = ChatOpenAI(
-                model="openai/gpt-4o-mini",
-                openai_api_base="https://openrouter.ai/api/v1",
-                response_format={"type": "json_object"}
-            )
-            
-            response = llm_with_json.invoke([("human", pattern_extraction_prompt)])
-            patterns = json.loads(response.content)
-            
-            self.logger.info(f"Extracted patterns for {model_name}")
-            return patterns
-            
-        except Exception as e:
-            self.logger.error(f"Error extracting patterns for {model_name}: {str(e)}")
-            return {
-                "successful_prompt_patterns": "Error in pattern extraction",
-                "common_good_practices": "Error in pattern extraction",
-                "common_bad_patterns": "Error in pattern extraction", 
-                "refinement_strategies": "Error in pattern extraction",
-                "pattern_summary": "Pattern extraction failed"
-            }
-    
-    def _save_patterns_to_local_memory(self, model_name: str, patterns: Dict[str, str], run_count: int):
-        """Save extracted patterns to local memory table."""
-        try:
-            # Determine table name for local memory
-            local_table_name = f"{model_name.lower().replace('-', '_')}_local_memory"
-            
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            # Insert patterns
-            cursor.execute(f'''
-                INSERT INTO {local_table_name} 
-                (timestamp, extraction_run_count, successful_prompt_patterns, common_good_practices, 
-                 common_bad_patterns, refinement_strategies, pattern_summary)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                datetime.now().isoformat(),
-                run_count,
-                patterns["successful_prompt_patterns"],
-                patterns["common_good_practices"],
-                patterns["common_bad_patterns"],
-                patterns["refinement_strategies"],
-                patterns["pattern_summary"]
-            ))
-            
-            conn.commit()
-            conn.close()
-            
-            self.logger.info(f"Saved patterns to {local_table_name} for run count {run_count}")
-            
-        except Exception as e:
-            self.logger.error(f"Error saving patterns to local memory: {str(e)}")
-    
-    def _check_and_extract_patterns(self, model_name: str):
-        """Check if pattern extraction is needed and perform it."""
-        try:
-            # Determine table names
-            global_table_name = f"{model_name.lower().replace('-', '_')}_memory"
-            local_table_name = f"{model_name.lower().replace('-', '_')}_local_memory"
-            
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            # Count global memory entries
-            cursor.execute(f"SELECT COUNT(*) FROM {global_table_name}")
-            global_count = cursor.fetchone()[0]
-            
-            # Get last extraction count
-            cursor.execute(f'''
-                SELECT MAX(extraction_run_count) FROM {local_table_name}
-            ''')
-            result = cursor.fetchone()
-            last_extraction_count = result[0] if result[0] is not None else 0
-            
-            conn.close()
-            
-            # Check if we need to extract patterns
-            if global_count >= last_extraction_count + self.pattern_extraction_frequency:
-                self.logger.info(f"Extracting patterns for {model_name} (global count: {global_count}, last extraction: {last_extraction_count})")
-                
-                # Extract and save patterns
-                patterns = self._extract_patterns_from_global_memory(model_name)
-                self._save_patterns_to_local_memory(model_name, patterns, global_count)
-                
-        except Exception as e:
-            self.logger.error(f"Error in pattern extraction check: {str(e)}")
-    
-    def get_latest_patterns(self, model_name: str) -> Dict[str, str]:
-        """Get the latest extracted patterns for a model."""
-        try:
-            local_table_name = f"{model_name.lower().replace('-', '_')}_local_memory"
-            
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            cursor.execute(f'''
-                SELECT successful_prompt_patterns, common_good_practices, common_bad_patterns, 
-                       refinement_strategies, pattern_summary
-                FROM {local_table_name}
-                ORDER BY timestamp DESC
-                LIMIT 1
-            ''')
-            
-            result = cursor.fetchone()
-            conn.close()
-            
-            if result:
-                return {
-                    "successful_prompt_patterns": result[0],
-                    "common_good_practices": result[1], 
-                    "common_bad_patterns": result[2],
-                    "refinement_strategies": result[3],
-                    "pattern_summary": result[4]
-                }
-            else:
-                return {
-                    "successful_prompt_patterns": "No patterns available yet",
-                    "common_good_practices": "No patterns available yet",
-                    "common_bad_patterns": "No patterns available yet", 
-                    "refinement_strategies": "No patterns available yet",
-                    "pattern_summary": "No patterns extracted yet"
-                }
-                
-        except Exception as e:
-            self.logger.error(f"Error getting latest patterns: {str(e)}")
-            return {
-                "successful_prompt_patterns": "Error retrieving patterns",
-                "common_good_practices": "Error retrieving patterns",
-                "common_bad_patterns": "Error retrieving patterns",
-                "refinement_strategies": "Error retrieving patterns", 
-                "pattern_summary": "Error retrieving patterns"
-            }
-    
     def save_model_memory(self, config_data: Dict[str, Any]):
-        """Save model performance analysis to memory database."""
+        """Save model performance analysis to memory database and update RAG indices."""
         print(f"DEBUG: save_model_memory called with config_data keys: {list(config_data.keys())}")
+        
+        # Initialize RAG system if needed
+        if self.embedding_model is None:
+            self._init_rag_system()
         
         # Generate process summary
         process_summary = self._generate_process_summary(config_data)
@@ -1282,16 +1441,9 @@ Return JSON format:
             # Prepare common data
             common_data = {
                 'timestamp': timestamp,
-                'image_index': str(config_data.get('image_index', '')),
                 'original_prompt': config_data.get('prompt_understanding', {}).get('original_prompt', ''),
-                'refined_prompt': config_data.get('prompt_understanding', {}).get('refined_prompt', ''),
-                'evaluation_score': regen_config.get('evaluation_score', 0.0),
-                'confidence_score': regen_config.get('confidence_score', 0.0),
-                'regeneration_count': i,
-                'good_things': analysis.get('good_things', ''),
-                'bad_things': analysis.get('bad_things', ''),
-                'config_data': json.dumps(config_data),
-                'process_summary': process_summary
+                'good_things': json.dumps(analysis.get('good_things', {})) if isinstance(analysis.get('good_things'), dict) else str(analysis.get('good_things', '')),
+                'bad_things': json.dumps(analysis.get('bad_things', {})) if isinstance(analysis.get('bad_things'), dict) else str(analysis.get('bad_things', '')),
             }
             
             print(f"DEBUG: Prepared common_data for {model_name}")
@@ -1300,17 +1452,17 @@ Return JSON format:
                 print(f"DEBUG: Inserting into qwen_image_memory")
                 cursor.execute('''
                     INSERT INTO qwen_image_memory 
-                    (timestamp, image_index, original_prompt, refined_prompt, evaluation_score, 
-                     confidence_score, regeneration_count, good_things, bad_things, config_data, process_summary)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (timestamp, original_prompt, good_things, bad_things)
+                    VALUES (?, ?, ?, ?)
                 ''', (
-                    common_data['timestamp'], common_data['image_index'], common_data['original_prompt'],
-                    common_data['refined_prompt'], common_data['evaluation_score'], common_data['confidence_score'],
-                    common_data['regeneration_count'], common_data['good_things'], common_data['bad_things'],
-                    common_data['config_data'], common_data['process_summary']
+                    common_data['timestamp'], common_data['original_prompt'],
+                    common_data['good_things'], common_data['bad_things']
                 ))
                 self.logger.info(f"Saved Qwen-Image memory for attempt {i+1}")
                 print(f"DEBUG: Successfully inserted into qwen_image_memory for attempt {i+1}")
+                
+                # Update RAG index
+                self._update_rag_index("qwen_image", common_data['original_prompt'], analysis)
                 
             elif model_name == "Qwen-Image-Edit":
                 # Only save Qwen-Image-Edit memory if there was regeneration (i > 0)
@@ -1318,19 +1470,17 @@ Return JSON format:
                     print(f"DEBUG: Inserting into qwen_image_edit_memory")
                     cursor.execute('''
                         INSERT INTO qwen_image_edit_memory 
-                        (timestamp, image_index, original_prompt, refined_prompt, evaluation_score, 
-                         confidence_score, regeneration_count, reference_image, good_things, bad_things, 
-                         config_data, process_summary)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        (timestamp, original_prompt, good_things, bad_things)
+                        VALUES (?, ?, ?, ?)
                     ''', (
-                        common_data['timestamp'], common_data['image_index'], common_data['original_prompt'],
-                        common_data['refined_prompt'], common_data['evaluation_score'], common_data['confidence_score'],
-                        common_data['regeneration_count'], regen_config.get('reference_content_image', ''),
-                        common_data['good_things'], common_data['bad_things'],
-                        common_data['config_data'], common_data['process_summary']
+                        common_data['timestamp'], common_data['original_prompt'],
+                        common_data['good_things'], common_data['bad_things']
                     ))
                     self.logger.info(f"Saved Qwen-Image-Edit memory for regeneration attempt {i+1}")
                     print(f"DEBUG: Successfully inserted into qwen_image_edit_memory for attempt {i+1}")
+                    
+                    # Update RAG index
+                    self._update_rag_index("qwen_image_edit", common_data['original_prompt'], analysis)
         
         print(f"DEBUG: About to commit changes to database")
         conn.commit()
@@ -1338,7 +1488,7 @@ Return JSON format:
         self.logger.info(f"Successfully saved model memory to database: {self.db_path}")
         print(f"DEBUG: Database operations completed successfully")
         
-        # Check and extract patterns for each model type used
+        # Save RAG indices to disk
         models_used = set()
         for i in range(regen_count + 1):
             config_key = f"count_{i}"
@@ -1349,7 +1499,20 @@ Return JSON format:
         
         print(f"DEBUG: Models used: {models_used}")
         for model_name in models_used:
-            self._check_and_extract_patterns(model_name)
+            if model_name == "Qwen-Image":
+                model_key = "qwen_image"
+            elif model_name == "Qwen-Image-Edit":
+                model_key = "qwen_image_edit"
+            else:
+                self.logger.warning(f"Unknown model name for RAG index: {model_name}")
+                continue
+            self._save_rag_index(model_key)
+
+    def _get_memory_guidance(self, model_name: str) -> str:
+        """Get memory guidance for model selection - now deprecated in favor of RAG guidance."""
+        # This method is deprecated since we now use RAG guidance at the beginning of the workflow
+        return ""
+
     
     def get_model_memory_summary(self, model_name: str, limit: int = 10) -> List[Dict]:
         """Retrieve recent memory entries for a specific model."""
@@ -1438,50 +1601,6 @@ def view_memory_database(db_path: str = "model_memory.db"):
                 print(f"    Reference Image: {row[6]}")
                 print(f"    Good Things: {row[7][:100]}...")
                 print(f"    Bad Things: {row[8][:100]}...")
-        
-        # Check Qwen-Image Local Memory (Patterns)
-        cursor.execute("SELECT COUNT(*) FROM qwen_image_local_memory")
-        qwen_image_local_count = cursor.fetchone()[0]
-        print(f"\nQwen-Image Local Memory (Patterns): {qwen_image_local_count}")
-        
-        if qwen_image_local_count > 0:
-            cursor.execute('''
-                SELECT timestamp, extraction_run_count, successful_prompt_patterns, 
-                       common_good_practices, pattern_summary
-                FROM qwen_image_local_memory 
-                ORDER BY timestamp DESC 
-                LIMIT 2
-            ''')
-            results = cursor.fetchall()
-            for i, row in enumerate(results):
-                print(f"\n  Pattern Entry {i+1}:")
-                print(f"    Timestamp: {row[0]}")
-                print(f"    Extraction Run Count: {row[1]}")
-                print(f"    Successful Patterns: {row[2][:150]}...")
-                print(f"    Good Practices: {row[3][:150]}...")
-                print(f"    Summary: {row[4][:150]}...")
-        
-        # Check Qwen-Image-Edit Local Memory (Patterns)
-        cursor.execute("SELECT COUNT(*) FROM qwen_image_edit_local_memory")
-        qwen_edit_local_count = cursor.fetchone()[0]
-        print(f"\nQwen-Image-Edit Local Memory (Patterns): {qwen_edit_local_count}")
-        
-        if qwen_edit_local_count > 0:
-            cursor.execute('''
-                SELECT timestamp, extraction_run_count, successful_prompt_patterns, 
-                       common_good_practices, pattern_summary
-                FROM qwen_image_edit_local_memory 
-                ORDER BY timestamp DESC 
-                LIMIT 2
-            ''')
-            results = cursor.fetchall()
-            for i, row in enumerate(results):
-                print(f"\n  Pattern Entry {i+1}:")
-                print(f"    Timestamp: {row[0]}")
-                print(f"    Extraction Run Count: {row[1]}")
-                print(f"    Successful Patterns: {row[2][:150]}...")
-                print(f"    Good Practices: {row[3][:150]}...")
-                print(f"    Summary: {row[4][:150]}...")
         
         conn.close()
         print(f"\n=== End Database Contents ===\n")
@@ -1785,6 +1904,36 @@ class ModelSelector:
 
     def _create_system_prompt(self) -> str:
         """Create the system prompt with all examples and guidelines."""
+        # Get RAG guidance for model selection steps
+        prompt_refinement_guidance = config.workflow_guidance.get("positive_guidance", {}).get("prompt_refinement", "")
+        negative_prompt_guidance = config.workflow_guidance.get("positive_guidance", {}).get("negative_prompt", "")
+        generation_guidance = config.workflow_guidance.get("positive_guidance", {}).get("generation", "")
+        
+        # Get warnings for next steps
+        negative_warnings = config.workflow_guidance.get("negative_warnings", {}).get("negative_prompt", "")
+        polishing_warnings = config.workflow_guidance.get("negative_warnings", {}).get("prompt_polishing", "")
+        generation_warnings = config.workflow_guidance.get("negative_warnings", {}).get("generation", "")
+        
+        # Build RAG guidance text
+        rag_guidance_text = ""
+        if any([prompt_refinement_guidance, negative_prompt_guidance, generation_guidance]):
+            rag_guidance_text += "\n\n=== RAG GUIDANCE FROM SIMILAR PROMPTS ===\n"
+            if prompt_refinement_guidance:
+                rag_guidance_text += f"PROMPT REFINEMENT INSIGHTS: {prompt_refinement_guidance}\n"
+            if negative_prompt_guidance:
+                rag_guidance_text += f"NEGATIVE PROMPT INSIGHTS: {negative_prompt_guidance}\n"
+            if generation_guidance:
+                rag_guidance_text += f"GENERATION INSIGHTS: {generation_guidance}\n"
+        
+        if any([negative_warnings, polishing_warnings, generation_warnings]):
+            rag_guidance_text += "\n=== WARNINGS FOR UPCOMING STEPS ===\n"
+            if negative_warnings:
+                rag_guidance_text += f"NEGATIVE PROMPT WARNINGS: {negative_warnings}\n"
+            if polishing_warnings:
+                rag_guidance_text += f"PROMPT POLISHING WARNINGS: {polishing_warnings}\n"
+            if generation_warnings:
+                rag_guidance_text += f"GENERATION WARNINGS: {generation_warnings}\n"
+            
         if config.regeneration_count > 0:
             return f"""Select the most suitable model for the given task and generate both positive and negative prompts.
             
@@ -1882,7 +2031,7 @@ class ModelSelector:
                     "reasoning": "This is a new portrait generation with specific style requirements, best handled by Qwen-Image",
                     "confidence_score": 0.95
                 }}
-            """
+            """ + rag_guidance_text
         else:
             return f"""Generate the most suitable prompt for the given task using Qwen-Image, including both positive and negative prompts.
             
@@ -1969,7 +2118,7 @@ class ModelSelector:
                     "reasoning": "This prompt requires generating a portrait with specific style elements while maintaining natural appearance",
                     "confidence_score": 0.95
                 }}
-            """
+            """ + rag_guidance_text
 
     def _create_task_prompt(self) -> str:
         """Create the task-specific prompt based on current state."""
@@ -2011,35 +2160,19 @@ class ModelSelector:
 
 
     def _get_memory_guidance(self, model_name: str) -> str:
-        """Get memory-based guidance for prompt generation."""
+        """Get RAG-based guidance for prompt generation."""
         if not self.memory_manager:
             return ""
         
         try:
-            patterns = self.memory_manager.get_latest_patterns(model_name)
-            
-            # Format patterns into guidance text
-            guidance_parts = []
-            
-            if patterns["successful_prompt_patterns"] != "No patterns available yet":
-                guidance_parts.append(f"SUCCESSFUL PATTERNS: {patterns['successful_prompt_patterns']}")
-            
-            if patterns["common_good_practices"] != "No patterns available yet":
-                guidance_parts.append(f"ENCOURAGE: {patterns['common_good_practices']}")
-            
-            if patterns["common_bad_patterns"] != "No patterns available yet":
-                guidance_parts.append(f"AVOID: {patterns['common_bad_patterns']}")
-            
-            if patterns["refinement_strategies"] != "No patterns available yet":
-                guidance_parts.append(f"REFINEMENT STRATEGIES: {patterns['refinement_strategies']}")
-            
-            if guidance_parts:
-                guidance = "MEMORY-BASED GUIDANCE:\n" + "\n".join(guidance_parts)
-                self.logger.debug(f"Added memory guidance for {model_name}: {guidance[:200]}...")
-                return guidance
-            
+            # Use RAG guidance if available from config
+            if hasattr(self.config, 'workflow_guidance') and self.config.workflow_guidance:
+                guidance = self.config.workflow_guidance.get(f'{model_name.lower()}_guidance', '')
+                if guidance:
+                    self.logger.debug(f"Added RAG guidance for {model_name}: {guidance[:200]}...")
+                    return f"RAG-BASED GUIDANCE:\n{guidance}"
         except Exception as e:
-            self.logger.error(f"Error getting memory guidance: {str(e)}")
+            self.logger.error(f"Error getting RAG guidance: {str(e)}")
         
         return ""
 
@@ -2156,15 +2289,41 @@ def intention_understanding_node(state: MessagesState) -> Command[str]:
         config.prompt_understanding["original_prompt"] = last_message.content
         logger.info("Step 1: Determining creativity level based on prompt")
         
-        # Determine creativity level based on prompt analysis
-        determined_creativity_level = analyzer.determine_creativity_level(last_message.content)
+        # Get RAG guidance for creativity level
+        creativity_guidance = config.workflow_guidance.get("positive_guidance", {}).get("creativity_level", "")
+        creativity_warnings = config.workflow_guidance.get("negative_warnings", {}).get("creativity_level", "")
+        
+        if creativity_guidance:
+            logger.info(f"RAG Guidance for Creativity Level: {creativity_guidance}")
+        if creativity_warnings:
+            logger.info(f"RAG Warning for Intention Analysis: {creativity_warnings}")
+        
+        # Determine creativity level based on prompt analysis with RAG guidance
+        determined_creativity_level = analyzer.determine_creativity_level(
+            last_message.content, 
+            rag_guidance=creativity_guidance
+        )
         config.prompt_understanding["creativity_level"] = determined_creativity_level
         logger.info(f"Determined creativity level: {determined_creativity_level.value}")
         
         logger.info("Step 2: Analyzing prompt")
         try:
-            # Analyze prompt
-            analysis = analyzer.analyze_prompt(last_message.content, config.prompt_understanding["creativity_level"])
+            # Get RAG guidance for intention analysis
+            intention_guidance = config.workflow_guidance.get("positive_guidance", {}).get("intention_analysis", "")
+            intention_warnings = config.workflow_guidance.get("negative_warnings", {}).get("intention_analysis", "")
+            
+            if intention_guidance:
+                logger.info(f"RAG Guidance for Intention Analysis: {intention_guidance}")
+            if intention_warnings:
+                logger.info(f"RAG Warning for Prompt Refinement: {intention_warnings}")
+            
+            # Analyze prompt with RAG guidance
+            analysis = analyzer.analyze_prompt(
+                last_message.content, 
+                config.prompt_understanding["creativity_level"],
+                rag_guidance=intention_guidance,
+                next_step_warnings=intention_warnings
+            )
             config.prompt_understanding["prompt_analysis"] = json.dumps(analysis)
             logger.info(f"Analysis result: {config.prompt_understanding['prompt_analysis']}")
             
@@ -2177,11 +2336,17 @@ def intention_understanding_node(state: MessagesState) -> Command[str]:
             logger.info(f"Suggested questions for users:\n {questions}")
             
             if questions == "SUFFICIENT_DETAIL" or questions == "AUTOCOMPLETE" or not config.is_human_in_loop:
-                # Refine prompt directly
+                # Get RAG guidance for prompt refinement
+                refinement_guidance = config.workflow_guidance.get("positive_guidance", {}).get("prompt_refinement", "")
+                refinement_warnings = config.workflow_guidance.get("negative_warnings", {}).get("prompt_refinement", "")
+                
+                # Refine prompt directly with RAG guidance
                 refinement_result = analyzer.refine_prompt_with_analysis(
                     last_message.content,
                     analysis,
-                    creativity_level=config.prompt_understanding["creativity_level"]
+                    creativity_level=config.prompt_understanding["creativity_level"],
+                    rag_guidance=refinement_guidance,
+                    next_step_warnings=refinement_warnings
                 )
                 config.prompt_understanding["refined_prompt"] = refinement_result['refined_prompt']
                 logger.info(f"With SUFFICIENT_DETAIL, AUTOCOMPLETE, or non-human-in-loop mode, Refinement result: {json.dumps(refinement_result, indent=2)}")
@@ -2230,12 +2395,18 @@ def intention_understanding_node(state: MessagesState) -> Command[str]:
                     # Parse user response
                     analysis = json.loads(config.prompt_understanding['prompt_analysis'])
                     
-                    # Refine prompt with user input
+                    # Get RAG guidance for prompt refinement
+                    refinement_guidance = config.workflow_guidance.get("positive_guidance", {}).get("prompt_refinement", "")
+                    refinement_warnings = config.workflow_guidance.get("negative_warnings", {}).get("prompt_refinement", "")
+                    
+                    # Refine prompt with user input and RAG guidance
                     refinement_result = analyzer.refine_prompt_with_analysis(
                         config.prompt_understanding['original_prompt'],
                         analysis,
                         user_responses,
-                        config.prompt_understanding["creativity_level"]
+                        config.prompt_understanding["creativity_level"],
+                        rag_guidance=refinement_guidance,
+                        next_step_warnings=refinement_warnings
                     )
                     config.prompt_understanding["refined_prompt"] = refinement_result['refined_prompt']
                     if 'suggested_creativity_level' in refinement_result:
@@ -2257,10 +2428,16 @@ def intention_understanding_node(state: MessagesState) -> Command[str]:
                     return command
                 else:
                     # If not human_in_the_loop, proceed with auto-refinement
+                    # Get RAG guidance for prompt refinement
+                    refinement_guidance = config.workflow_guidance.get("positive_guidance", {}).get("prompt_refinement", "")
+                    refinement_warnings = config.workflow_guidance.get("negative_warnings", {}).get("prompt_refinement", "")
+                    
                     refinement_result = analyzer.refine_prompt_with_analysis(
                         last_message.content,
                         analysis,
-                        creativity_level=CreativityLevel.HIGH
+                        creativity_level=CreativityLevel.HIGH,
+                        rag_guidance=refinement_guidance,
+                        next_step_warnings=refinement_warnings
                     )
                     config.prompt_understanding["refined_prompt"] = refinement_result['refined_prompt']
                     logger.info(f"Auto-refinement result (non-human-in-loop): {json.dumps(refinement_result, indent=2)}")
@@ -2471,13 +2648,18 @@ def evaluation_node(state: MessagesState) -> Command[str]:
     try:
         current_config = config.get_current_config()
         
-        # Prepare evaluation prompt
+        # Prepare evaluation prompt with RAG guidance
+        evaluation_guidance = config.workflow_guidance.get("positive_guidance", {}).get("evaluation", "")
+        guidance_text = ""
+        if evaluation_guidance:
+            guidance_text = f"\n\nRAG GUIDANCE FOR EVALUATION:\n{evaluation_guidance}\n\nConsider this guidance when evaluating the image."
+        
         with open(current_config['gen_image_path'], "rb") as image_file:
             base64_gen_image = base64.b64encode(image_file.read()).decode("utf-8")
         evaluation_prompt = [
             (
                 "system",
-                make_gen_image_judge_prompt(config)
+                make_gen_image_judge_prompt(config) + guidance_text
             ),
             (
                 "human",
@@ -2498,11 +2680,24 @@ def evaluation_node(state: MessagesState) -> Command[str]:
         
         # Get evaluation from Qwen-VL
         evaluation_result = track_llm_call(llm_json.invoke, "evaluation", evaluation_prompt)
-        evaluation_data = json.loads(evaluation_result.content)
+        
+        try:
+            if isinstance(evaluation_result.content, str):
+                evaluation_data = json.loads(evaluation_result.content)
+            else:
+                evaluation_data = evaluation_result.content
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse evaluation JSON: {str(e)}")
+            logger.error(f"Raw evaluation response: {evaluation_result.content}")
+            # Fallback evaluation data
+            evaluation_data = {
+                "overall_score": 5.0,
+                "improvement_suggestions": "Unable to parse evaluation response. Manual review recommended."
+            }
 
         # Update config with evaluation score
-        current_config["evaluation_score"] = evaluation_data["overall_score"]
-        current_config["improvement_suggestions"] = evaluation_data["improvement_suggestions"]
+        current_config["evaluation_score"] = evaluation_data.get("overall_score", 5.0)
+        current_config["improvement_suggestions"] = evaluation_data.get("improvement_suggestions", "No specific suggestions available")
         logger.info(f"Evaluation result: {json.dumps(evaluation_data, indent=2)}")
         
         # Define threshold for acceptable quality
@@ -2845,6 +3040,48 @@ def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, o
 
             # Initialize memory manager for this iteration with proper logger
             memory_manager = MemoryManager(logger=logger)
+            
+            # Set the original prompt for RAG guidance retrieval
+            config.prompt_understanding["original_prompt"] = text_prompt
+            
+            # Retrieve RAG guidance at the beginning of the workflow
+            try:
+                logger.info("Retrieving RAG workflow guidance...")
+                
+                # Determine model type based on prompt content
+                model_type = "qwen_image"  # Default
+                if any(keyword in text_prompt.lower() for keyword in ["edit", "modify", "change", "adjust", "reference"]):
+                    model_type = "qwen_image_edit"
+                
+                guidance = memory_manager.get_workflow_guidance(text_prompt, model_type)
+                config.workflow_guidance = guidance
+                config.rag_guidance_retrieved = True
+                
+                logger.info("Successfully retrieved RAG workflow guidance:")
+                logger.info(f"Positive guidance: {guidance['positive_guidance']}")
+                logger.info(f"Negative warnings: {guidance['negative_warnings']}")
+                
+            except Exception as e:
+                logger.error(f"Failed to retrieve RAG guidance: {str(e)}")
+                config.workflow_guidance = {
+                    "positive_guidance": {
+                        "creativity_level": "",
+                        "intention_analysis": "",
+                        "prompt_refinement": "",
+                        "negative_prompt": "",
+                        "prompt_polishing": "",
+                        "generation": "",
+                        "evaluation": ""
+                    },
+                    "negative_warnings": {
+                        "creativity_level": "",
+                        "intention_analysis": "",
+                        "prompt_refinement": "",
+                        "negative_prompt": "",
+                        "prompt_polishing": "",
+                        "generation": ""
+                    }
+                }
 
             # start timing
             torch.cuda.reset_peak_memory_stats(0)
