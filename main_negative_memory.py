@@ -164,12 +164,10 @@ class T2IConfig:
         if isinstance(prompt_understanding["prompt_analysis"], str):
             # Handle empty string case first
             if not prompt_understanding["prompt_analysis"].strip():
-                self.logger.debug("Before prompt analyze, so getting empty prompt_analysis string, using empty dict")
                 prompt_understanding["prompt_analysis"] = {}
             else:
                 try:
                     prompt_understanding["prompt_analysis"] = json.loads(prompt_understanding["prompt_analysis"])
-                    self.logger.debug("Successfully parsed prompt_analysis JSON string")
                 except json.JSONDecodeError:
                     self.logger.error("Invalid JSON string in prompt_analysis")
                     try:
@@ -177,12 +175,11 @@ class T2IConfig:
                         prompt_understanding["prompt_analysis"] = {
                             "raw_content": prompt_understanding["prompt_analysis"]
                         }
-                        self.logger.debug("Preserved raw prompt_analysis content")
                     except Exception as e:
                         self.logger.error(f"Failed to preserve prompt analysis content: {e}")
                         prompt_understanding["prompt_analysis"] = {}
         elif isinstance(prompt_understanding["prompt_analysis"], dict):
-            self.logger.debug("prompt_analysis is already a dictionary")
+            pass  # Already a dictionary
         else:
             self.logger.warning(f"Unexpected prompt_analysis type: {type(prompt_understanding['prompt_analysis'])}")
             prompt_understanding["prompt_analysis"] = {}
@@ -312,15 +309,17 @@ class IntentionAnalyzer:
 
     def determine_creativity_level(self, prompt: str, rag_guidance: str = "") -> CreativityLevel:
         """Analyze the prompt to automatically determine the appropriate creativity level."""
-        self.logger.debug(f"Determining creativity level for prompt: '{prompt}'")
         
         # Include RAG guidance in the analysis prompt
         rag_guidance_text = ""
         if rag_guidance:
-            rag_guidance_text = f"\n\nRAG GUIDANCE FOR CREATIVITY LEVEL:\n{rag_guidance}\n\nConsider this guidance when determining the creativity level."
-            self.logger.info(f"=== CREATIVITY LEVEL - RAG GUIDANCE ADDED ===")
-            self.logger.info(f"RAG Guidance Length: {len(rag_guidance)} characters")
-            self.logger.info(f"RAG Guidance Content:\n{rag_guidance}")
+            # Check if rag_guidance already contains workflow guidance (which has its own GUIDANCE header)
+            if "=== GUIDANCE ===" in rag_guidance:
+                # Already formatted with guidance headers, use as-is
+                rag_guidance_text = f"\n\n{rag_guidance}"
+            else:
+                # Simple RAG guidance without workflow context, add header
+                rag_guidance_text = f"\n\n=== GUIDANCE ===\n{rag_guidance}"
         
         creativity_analysis_prompt = """You are an expert at analyzing image generation prompts to determine the appropriate creativity level.
 
@@ -393,10 +392,10 @@ Output: {
 }"""
 
         # Construct the full system prompt with guidance
-        full_system_prompt = creativity_analysis_prompt
+        full_system_prompt = creativity_analysis_prompt + rag_guidance_text
         
-        # Log the complete guidance prompt
-        self.logger.info(f"=== CREATIVITY LEVEL - COMPLETE SYSTEM PROMPT ===")
+        # Log the complete system prompt after adding guidance
+        self.logger.info(f"=== CREATIVITY LEVEL - COMPLETE SYSTEM PROMPT (with guidance) ===")
         self.logger.info(f"Full System Prompt Length: {len(full_system_prompt)} characters")
         self.logger.info(f"Full System Prompt:\n{full_system_prompt}")
         self.logger.info(f"=== END CREATIVITY LEVEL PROMPT ===")
@@ -404,7 +403,6 @@ Output: {
         try:
             # Count the number of words in the prompt for additional context
             word_count = len(prompt.split())
-            self.logger.info(f"Prompt word count: {word_count}")
             
             # Include word count in the analysis request
             response = track_llm_call(self.llm_json.invoke, "creativity_determination", [
@@ -431,14 +429,11 @@ Output: {
             # Apply word count heuristic as a fallback or sanity check
             word_count = len(prompt.split())
             if word_count <= 5 and creativity_level != CreativityLevel.HIGH:
-                self.logger.info(f"Overriding creativity level to HIGH based on very low word count ({word_count})")
                 creativity_level = CreativityLevel.HIGH
             elif word_count >= 25 and creativity_level != CreativityLevel.LOW:
-                self.logger.info(f"Overriding creativity level to LOW based on high word count ({word_count})")
                 creativity_level = CreativityLevel.LOW
                 
             self.logger.info(f"Determined creativity level: {creativity_level.value}")
-            self.logger.info(f"Reasoning: {reasoning}")
             
             return creativity_level
             
@@ -448,13 +443,10 @@ Output: {
             self.logger.error(f"Error in creativity determination: {str(e)}. Using word count heuristic.")
             
             if word_count <= 5:
-                self.logger.info(f"Setting creativity to HIGH based on low word count ({word_count})")
                 return CreativityLevel.HIGH
             elif word_count >= 25:
-                self.logger.info(f"Setting creativity to LOW based on high word count ({word_count})")
                 return CreativityLevel.LOW
             else:
-                self.logger.info(f"Setting creativity to MEDIUM based on moderate word count ({word_count})")
                 return CreativityLevel.MEDIUM
 
     def identify_image_path(self, prompt: str) -> str:
@@ -468,8 +460,6 @@ Output: {
 
             if parsed_url.scheme in ['http', 'https']:
                 # It's a URL
-                # print(f"Identified URL: {path_or_url}")
-                self.logger.debug(f"Identified URL: {path_or_url}")
                 return path_or_url, "url"
             else:
                 # It's a local file path
@@ -477,49 +467,35 @@ Output: {
                 if os.path.exists(full_path):
                     return full_path, "local"
                 else:
-                    # print(f"Image '{full_path}' not found.")
                     self.logger.error(f"Image '{full_path}' not found.")
                     return None, None
-        # print("No valid image file or URL found in the prompt.")
-        self.logger.debug("No valid image file or URL found in the prompt.")
+        
         return None, None
 
     def analyze_prompt(self, prompt: str, creativity_level: CreativityLevel, rag_guidance: str = "", workflow_context: Dict[str, Any] = None) -> Dict[str, Any]:
         """Analyze the prompt and identify elements that need clarification."""
-        self.logger.debug(f"Starting prompt analysis for: '{prompt[:100]}...'")
-        self.logger.debug(f"Creativity level: {creativity_level.value}")
-        self.logger.debug(f"RAG guidance provided: {bool(rag_guidance)}")
-        self.logger.debug(f"Workflow context provided: {bool(workflow_context)}")
         
         guidance_text = ""
-        if rag_guidance:
-            guidance_text += f"\n\nRAG GUIDANCE FOR INTENTION ANALYSIS:\n{rag_guidance}"
-            self.logger.debug(f"Added RAG guidance ({len(rag_guidance)} chars)")
-            self.logger.info(f"=== INTENTION ANALYSIS - RAG GUIDANCE ADDED ===")
-            self.logger.info(f"RAG Guidance Content:\n{rag_guidance}")
-        
+        # Use workflow guidance as the primary guidance source (includes processed RAG guidance)
         if workflow_context:
             workflow_guidance = format_workflow_guidance_text(workflow_context, include_overview=True)
             guidance_text += f"\n\n{workflow_guidance}"
-            self.logger.debug(f"Added workflow guidance ({len(workflow_guidance)} chars)")
-            self.logger.info(f"=== INTENTION ANALYSIS - WORKFLOW CONTEXT ADDED ===")
-            self.logger.info(f"Workflow Guidance Content:\n{workflow_guidance}")
-        
-        self.logger.info(f"Total guidance text length: {len(guidance_text)} characters")
+        # Only add RAG guidance if no workflow context is available
+        elif rag_guidance:
+            guidance_text += f"\n\n=== GUIDANCE ===\n{rag_guidance}"
 
         image_dir_in_prompt, image_type = self.identify_image_path(prompt)
         
         base_intention_prompt = make_intention_analysis_prompt()
         complete_system_prompt = base_intention_prompt + guidance_text
         
-        self.logger.info(f"=== INTENTION ANALYSIS - COMPLETE SYSTEM PROMPT ===")
-        self.logger.info(f"Base Prompt Length: {len(base_intention_prompt)} characters")
+        # Log the complete system prompt after adding guidance
+        self.logger.info(f"=== INTENTION ANALYSIS - COMPLETE SYSTEM PROMPT (with guidance) ===")
         self.logger.info(f"Complete System Prompt Length: {len(complete_system_prompt)} characters")
         self.logger.info(f"Complete System Prompt:\n{complete_system_prompt}")
         self.logger.info(f"=== END INTENTION ANALYSIS PROMPT ===")
         
         if image_dir_in_prompt:
-            self.logger.debug(f"Identifying image from: {image_dir_in_prompt}; Image type: {image_type}")
             if image_type == "url":
                 analysis_prompt = [
                                     (
@@ -570,9 +546,6 @@ Output: {
         
         # Get response as string and parse it to dict
         response = track_llm_call(self.llm_json.invoke, "intention_analysis", analysis_prompt)
-        self.logger.debug(f"Raw LLM response type: {type(response)}")
-        self.logger.debug(f"Raw LLM response length: {len(str(response))}")
-        self.logger.debug(f"Raw LLM response content preview: {str(response)[:200]}...")
         
         # response is <class 'langchain_core.messages.ai.AIMessage'>
         # response.content is <class 'str'>
@@ -580,28 +553,21 @@ Output: {
         try:
             if isinstance(response.content, str):
                 parsed_response = json.loads(response.content)
-                self.logger.debug(f"Successfully parsed JSON from string response")
             elif isinstance(response.content, dict):
                 parsed_response = response.content
-                self.logger.debug(f"Response content was already a dict")
             elif isinstance(response.content, json):
                 parsed_response = response.content
-                self.logger.debug(f"Response content was JSON object")
             else:
                 raise ValueError(f"Unexpected response type: {type(response)}")
                 
-            self.logger.debug(f"Parsed response keys: {list(parsed_response.keys()) if isinstance(parsed_response, dict) else 'Not a dict'}")
             self.logger.info(f"Successfully completed prompt analysis with {len(parsed_response.get('ambiguous_elements', []))} ambiguous elements")
             return parsed_response
             
         except json.JSONDecodeError as e:
             self.logger.error(f"JSON decode error in prompt analysis: {str(e)}")
-            self.logger.error(f"Raw response content that failed to parse: {response.content}")
-            self.logger.error(f"Response object: {response}")
             raise
         except Exception as e:
             self.logger.error(f"Unexpected error in prompt analysis: {str(e)}")
-            self.logger.error(f"Response type: {type(response)}, Content type: {type(response.content) if hasattr(response, 'content') else 'No content attr'}")
             raise
 
     def retrieve_reference(self, analysis: Dict[str, Any]):
@@ -611,8 +577,6 @@ Output: {
         current_config = config.get_current_config()
         if "references" in analysis["identified_elements"] and analysis["identified_elements"]["references"].get("content"):
             current_config["reference_content_image"] = analysis["identified_elements"]["references"]["content"]
-        
-        self.logger.debug(f"Retrieved reference content image: {current_config['reference_content_image']}")
         
     def retrieve_questions(self, analysis: Dict[str, Any], creativity_level: CreativityLevel) -> str:
         """Retrieve questions based on the analysis and creativity level."""
@@ -664,32 +628,16 @@ Output: {
             - refined_prompt: str
             - suggested_creativity_level: CreativityLevel (only when user_responses provided)
         """
-        self.logger.debug(f"Starting prompt refinement")
-        self.logger.debug(f"Original prompt: '{original_prompt[:100]}...'")
-        self.logger.debug(f"User responses provided: {bool(user_responses)}")
-        if user_responses:
-            self.logger.debug(f"User responses keys: {list(user_responses.keys())}")
-        self.logger.debug(f"Creativity level: {creativity_level.value}")
-        self.logger.debug(f"RAG guidance provided: {bool(rag_guidance)}")
-        self.logger.debug(f"Workflow context provided: {bool(workflow_context)}")
         
-        # Prepare RAG guidance text
+        # Prepare guidance text - prioritize workflow guidance over separate RAG guidance
         guidance_text = ""
-        if rag_guidance:
-            guidance_text += f"\n\nRAG GUIDANCE FOR PROMPT REFINEMENT:\n{rag_guidance}\nUse this guidance to improve the refinement process."
-            self.logger.debug(f"Added RAG guidance ({len(rag_guidance)} chars)")
-            self.logger.info(f"=== PROMPT REFINEMENT - RAG GUIDANCE ADDED ===")
-            self.logger.info(f"RAG Guidance Content:\n{rag_guidance}")
-        
-        # Add comprehensive workflow context
+        # Use workflow guidance as the primary guidance source (includes processed RAG guidance)
         if workflow_context:
             workflow_guidance = format_workflow_guidance_text(workflow_context, include_overview=False)
             guidance_text += f"\n\n{workflow_guidance}"
-            self.logger.debug(f"Added workflow guidance ({len(workflow_guidance)} chars)")
-            self.logger.info(f"=== PROMPT REFINEMENT - WORKFLOW CONTEXT ADDED ===")
-            self.logger.info(f"Workflow Guidance Content:\n{workflow_guidance}")
-        
-        self.logger.info(f"Total refinement guidance text length: {len(guidance_text)} characters")
+        # Only add RAG guidance if no workflow context is available
+        elif rag_guidance:
+            guidance_text += f"\n\n=== GUIDANCE ===\n{rag_guidance}"
         
         if user_responses:
             refinement_prompt = f"""
@@ -767,40 +715,33 @@ Output: {
             """
         
         # Log the complete refinement prompt
-        self.logger.info(f"=== PROMPT REFINEMENT - COMPLETE SYSTEM PROMPT ===")
+        self.logger.info(f"=== PROMPT REFINEMENT - COMPLETE SYSTEM PROMPT (with guidance) ===")
         self.logger.info(f"Refinement Prompt Length: {len(refinement_prompt)} characters")
         self.logger.info(f"Refinement Prompt:\n{refinement_prompt}")
         self.logger.info(f"=== END PROMPT REFINEMENT PROMPT ===")
         
         response = track_llm_call(self.llm_json.invoke, "refine_prompt", refinement_prompt)
-        self.logger.debug(f"Refinement response type: {type(response)}")
-        self.logger.debug(f"Refinement response length: {len(str(response))}")
 
         try:
             if isinstance(response.content, str):
                 parsed_response = json.loads(response.content)
-                self.logger.debug(f"Successfully parsed JSON from string response")
             elif isinstance(response.content, dict):
                 parsed_response = response.content
-                self.logger.debug(f"Response content was already a dict")
             elif isinstance(response.content, json):
                 parsed_response = response.content
-                self.logger.debug(f"Response content was JSON object")
             else:
                 raise ValueError(f"Unexpected response type: {type(response)}")
                 
-            self.logger.debug(f"Parsed refinement keys: {list(parsed_response.keys()) if isinstance(parsed_response, dict) else 'Not a dict'}")
-            self.logger.info(f"Successfully refined prompt: '{parsed_response.get('refined_prompt', 'No refined_prompt key')[:100]}...'")
+            refined_prompt = parsed_response.get('refined_prompt', 'No refined_prompt key')
+            self.logger.info(f"Successfully refined prompt - COMPLETE PROMPT:")
+            self.logger.info(f"REFINED: {refined_prompt}")
             return parsed_response
             
         except json.JSONDecodeError as e:
             self.logger.error(f"JSON decode error in prompt refinement: {str(e)}")
-            self.logger.error(f"Raw response content that failed to parse: {response.content}")
-            self.logger.error(f"Response object: {response}")
             raise
         except Exception as e:
             self.logger.error(f"Unexpected error in prompt refinement: {str(e)}")
-            self.logger.error(f"Response type: {type(response)}, Content type: {type(response.content) if hasattr(response, 'content') else 'No content attr'}")
             raise
 
 
@@ -811,12 +752,17 @@ class NegativePromptGenerator:
         self.llm_json = llm.bind(response_format={"type": "json_object"})
         self.logger = logger
 
-    def generate_negative_prompt(self, positive_prompt: str, analysis: Dict[str, Any] = None) -> Dict[str, Any]:
+    def generate_negative_prompt(self, positive_prompt: str, analysis: Dict[str, Any] = None, rag_guidance: str = "", workflow_context: Dict[str, Any] = None) -> Dict[str, Any]:
         """Generate a negative prompt based on the positive prompt and analysis."""
-        self.logger.debug(f"Starting negative prompt generation for: '{positive_prompt[:100]}...'")
-        self.logger.debug(f"Analysis provided: {bool(analysis)}")
-        if analysis:
-            self.logger.debug(f"Analysis keys: {list(analysis.keys()) if isinstance(analysis, dict) else 'Not a dict'}")
+        
+        guidance_text = ""
+        # Use workflow guidance as the primary guidance source (includes processed RAG guidance)
+        if workflow_context:
+            workflow_guidance = format_workflow_guidance_text(workflow_context, include_overview=False)
+            guidance_text += f"\n\n{workflow_guidance}"
+        # Only add RAG guidance if no workflow context is available
+        elif rag_guidance:
+            guidance_text += f"\n\n=== GUIDANCE ===\n{rag_guidance}"
         
         negative_prompt_system = """You are an expert at generating negative prompts for image generation models like Qwen-Image and Qwen-Image-Edit.
 
@@ -843,7 +789,7 @@ Examples:
 - Portrait: "blurry, low quality, distorted face, multiple heads, extra limbs, watermark, text"
 - Landscape: "people, buildings, text, watermark, low quality, blurry, oversaturated"
 - Fantasy scene: "modern objects, realistic style, low quality, blurry, watermark, text"
-"""
+""" + guidance_text
 
         if analysis:
             analysis_text = f"\nPrompt analysis context: {json.dumps(analysis, indent=2)}"
@@ -855,6 +801,12 @@ Positive prompt: "{positive_prompt}"{analysis_text}
 
 Consider the scene type, style, and content to determine what should be avoided."""
 
+        # Log the complete negative prompt system prompt with guidance
+        self.logger.info(f"=== NEGATIVE PROMPT - COMPLETE SYSTEM PROMPT (with guidance) ===")
+        self.logger.info(f"System Prompt Length: {len(negative_prompt_system)} characters")
+        self.logger.info(f"System Prompt:\n{negative_prompt_system}")
+        self.logger.info(f"=== END NEGATIVE PROMPT SYSTEM PROMPT ===")
+
         try:
             response = track_llm_call(
                 self.llm_json.invoke, 
@@ -865,26 +817,21 @@ Consider the scene type, style, and content to determine what should be avoided.
                 ]
             )
             
-            self.logger.debug(f"Negative prompt response type: {type(response)}")
-            self.logger.debug(f"Negative prompt response length: {len(str(response))}")
-            
             if isinstance(response.content, str):
                 parsed_response = json.loads(response.content)
-                self.logger.debug(f"Successfully parsed negative prompt JSON from string")
             elif isinstance(response.content, dict):
                 parsed_response = response.content
-                self.logger.debug(f"Negative prompt response was already a dict")
             else:
                 raise ValueError(f"Unexpected response type: {type(response.content)}")
                 
-            self.logger.info(f"Generated negative prompt: '{parsed_response.get('negative_prompt', 'No negative_prompt key')}'")
-            self.logger.debug(f"Negative prompt reasoning: {parsed_response.get('reasoning', 'No reasoning provided')}")
+            negative_prompt = parsed_response.get('negative_prompt', 'No negative_prompt key')
+            self.logger.info(f"Generated negative prompt - COMPLETE PROMPT:")
+            self.logger.info(f"NEGATIVE: {negative_prompt}")
             
             return parsed_response
             
         except Exception as e:
             self.logger.error(f"Failed to generate negative prompt: {str(e)}")
-            self.logger.error(f"Falling back to generic negative prompt")
             # Fallback to generic negative prompt
             return {
                 "negative_prompt": "low quality, blurry, distorted, watermark, text, bad anatomy",
@@ -949,9 +896,10 @@ class MemoryManager:
                     evaluation_score REAL,
                     confidence_score REAL,
                     regeneration_count INTEGER,
+                    trajectory_reasoning TEXT,
+                    step_scores TEXT,
                     good_things TEXT,
                     bad_things TEXT,
-                    ratings TEXT,
                     overall_rating REAL,
                     config_data TEXT,
                     process_summary TEXT
@@ -970,9 +918,10 @@ class MemoryManager:
                     confidence_score REAL,
                     regeneration_count INTEGER,
                     reference_image TEXT,
+                    trajectory_reasoning TEXT,
+                    step_scores TEXT,
                     good_things TEXT,
                     bad_things TEXT,
-                    ratings TEXT,
                     overall_rating REAL,
                     config_data TEXT,
                     process_summary TEXT
@@ -1224,10 +1173,31 @@ class MemoryManager:
                     }
                 }
             
+            # Log extracted similar prompts for transparency
+            print("=" * 80)
+            print(f"MEMORY MANAGER - EXTRACTED SIMILAR PROMPTS ({model_type.upper()})")
+            print("=" * 80)
+            print(f"Query Prompt: {prompt}")
+            print(f"Found {len(similar_prompts)} similar prompts:")
+            print("-" * 80)
+            
+            for i, entry in enumerate(similar_prompts, 1):
+                sim_prompt = entry.get('prompt', 'N/A')
+                score = entry.get('similarity_score', 0.0)
+                # Show complete similar prompts for better understanding
+                print(f"#{i} (Score: {score:.3f}):")
+                print(f"   PROMPT: {sim_prompt}")
+                print()
+                
+            print("-" * 80)
+            print(f"→ Generating guidance from {len(similar_prompts)} similar examples...")
+            print("=" * 80)
             self.logger.info(f"Found {len(similar_prompts)} similar prompts for guidance generation")
             
             # Extract insights from similar prompts
-            return self._analyze_similar_prompts_for_guidance(similar_prompts)
+            guidance = self._analyze_similar_prompts_for_guidance(similar_prompts)
+            
+            return guidance
             
         except Exception as e:
             self.logger.error(f"Failed to get workflow guidance: {str(e)}")
@@ -1295,17 +1265,19 @@ class MemoryManager:
                         continue
                 
                 if isinstance(analysis, dict):
+                    trajectory_reasoning = analysis.get('trajectory_reasoning', '')
+                    step_scores = analysis.get('step_scores', {})
                     good_things = analysis.get('good_things', {})
                     bad_things = analysis.get('bad_things', {})
-                    ratings = analysis.get('ratings', {})
                     overall_rating = analysis.get('overall_rating', 0)
                     
                     analysis_data.append({
                         'prompt': prompt,
                         'similarity': similarity,
+                        'trajectory_reasoning': trajectory_reasoning,
+                        'step_scores': step_scores,
                         'good_things': good_things,
                         'bad_things': bad_things,
-                        'ratings': ratings,
                         'overall_rating': overall_rating
                     })
             
@@ -1330,6 +1302,24 @@ class MemoryManager:
                 similar_data_text += f"\n===== EXAMPLE {i+1} (SIMILARITY: {similarity:.3f}) =====\n"
                 similar_data_text += f"PROMPT: '{prompt}'\n"
                 
+                # Add trajectory reasoning section
+                trajectory_reasoning = entry.get('trajectory_reasoning', '')
+                if trajectory_reasoning:
+                    similar_data_text += f"TRAJECTORY REASONING: {trajectory_reasoning}\n"
+                
+                # Add step scores section
+                step_scores = entry.get('step_scores', {})
+                overall_rating = entry.get('overall_rating', 0)
+                
+                similar_data_text += "STEP SCORES (1-10):\n"
+                if isinstance(step_scores, dict):
+                    for step, score in step_scores.items():
+                        similar_data_text += f"- [{step}]: {score}\n"
+                else:
+                    similar_data_text += f"- Step scores data format issue\n"
+                
+                similar_data_text += f"- [overall_rating]: {overall_rating}/10\n"
+                
                 # Add successful strategies section
                 similar_data_text += "SUCCESSFUL STRATEGIES:\n"
                 for step, success in good_things.items():
@@ -1339,19 +1329,6 @@ class MemoryManager:
                 similar_data_text += "PROBLEMS/ISSUES:\n"
                 for step, issue in bad_things.items():
                     similar_data_text += f"- [{step}]: {issue}\n"
-                
-                # Add ratings section
-                ratings = entry.get('ratings', {})
-                overall_rating = entry.get('overall_rating', 0)
-                
-                similar_data_text += "RATINGS (1-10):\n"
-                if isinstance(ratings, dict):
-                    for step, rating in ratings.items():
-                        similar_data_text += f"- [{step}]: {rating}\n"
-                else:
-                    similar_data_text += f"- Ratings data format issue\n"
-                
-                similar_data_text += f"- [overall_rating]: {overall_rating}/10\n"
                 
                 similar_data_text += "="*50 + "\n"
                 
@@ -1378,54 +1355,61 @@ INSTRUCTIONS:
 Return JSON with this EXACT structure:
 {{
     "step_analysis": {{
-        "creativity_level": {{
+        "creativity_level_determination": {{
             "success_patterns": "SPECIFIC creativity level patterns that worked for this type of prompt",
             "failure_patterns": "SPECIFIC creativity level mistakes observed with similar prompts",
             "impact_on_next": "CONCRETE impact on intention analysis quality",
             "preventive_guidance": "DETAILED advice with SPECIFIC examples of what to look for",
-            "recommended_rating": "Recommend an optimal setting (1-10) based on similar examples"
+            "recommended_score": "Recommend target score (1-10) based on similar examples"
         }},
         "intention_analysis": {{
             "success_patterns": "SPECIFIC intention analysis techniques that worked for this subject matter",
             "failure_patterns": "SPECIFIC intention analysis pitfalls observed with similar prompts", 
             "impact_on_next": "CONCRETE impact on prompt refinement",
             "preventive_guidance": "DETAILED advice with SPECIFIC elements to identify",
-            "recommended_rating": "Recommend an optimal approach (1-10) based on similar examples"
+            "recommended_score": "Recommend target score (1-10) based on similar examples"
         }},
         "prompt_refinement": {{
             "success_patterns": "SPECIFIC refinement strategies that enhanced similar prompts",
             "failure_patterns": "SPECIFIC refinement mistakes observed in similar cases",
             "impact_on_next": "CONCRETE impact on negative prompt generation",
             "preventive_guidance": "DETAILED advice with SPECIFIC refinement techniques",
-            "recommended_rating": "Recommend an optimal approach (1-10) based on similar examples"
+            "recommended_score": "Recommend target score (1-10) based on similar examples"
         }},
-        "negative_prompt": {{
+        "negative_prompt_generation": {{
             "success_patterns": "SPECIFIC negative prompt elements that were effective for this subject",
             "failure_patterns": "SPECIFIC negative prompt issues observed in similar cases",
             "impact_on_next": "CONCRETE impact on prompt polishing",
             "preventive_guidance": "DETAILED advice with SPECIFIC terms to include/exclude",
-            "recommended_rating": "Recommend an optimal approach (1-10) based on similar examples"
+            "recommended_score": "Recommend target score (1-10) based on similar examples"
         }},
         "prompt_polishing": {{
             "success_patterns": "SPECIFIC polishing techniques that improved similar prompts",
             "failure_patterns": "SPECIFIC polishing issues observed with this type of content",
             "impact_on_next": "CONCRETE impact on generation quality",
             "preventive_guidance": "DETAILED advice with SPECIFIC polishing approaches",
-            "recommended_rating": "Recommend an optimal approach (1-10) based on similar examples"
+            "recommended_score": "Recommend target score (1-10) based on similar examples"
         }},
-        "generation": {{
+        "image_generation": {{
             "success_patterns": "SPECIFIC generation parameters that worked for similar content",
             "failure_patterns": "SPECIFIC generation issues observed with this prompt type",
             "impact_on_next": "CONCRETE impact on evaluation accuracy",
             "preventive_guidance": "DETAILED advice with SPECIFIC generation settings",
-            "recommended_rating": "Recommend an optimal approach (1-10) based on similar examples"
+            "recommended_score": "Recommend target score (1-10) based on similar examples"
         }},
-        "evaluation": {{
+        "quality_evaluation": {{
             "success_patterns": "SPECIFIC evaluation criteria effective for this content type",
             "failure_patterns": "SPECIFIC evaluation pitfalls observed with similar outputs",
-            "impact_on_next": "N/A - final step",
+            "impact_on_next": "CONCRETE impact on regeneration decision",
             "preventive_guidance": "DETAILED advice with SPECIFIC quality indicators",
-            "recommended_rating": "Recommend an optimal approach (1-10) based on similar examples"
+            "recommended_score": "Recommend target score (1-10) based on similar examples"
+        }},
+        "regeneration_decision": {{
+            "success_patterns": "SPECIFIC decision criteria that led to successful outcomes",
+            "failure_patterns": "SPECIFIC regeneration mistakes observed with similar content",
+            "impact_on_next": "N/A - final step",
+            "preventive_guidance": "DETAILED advice with SPECIFIC decision factors",
+            "recommended_score": "Recommend target score (1-10) based on similar examples"
         }}
     }},
     "workflow_insights": {{
@@ -1463,24 +1447,52 @@ Instead provide domain-specific, technical recommendations based on the actual e
                 result = response.content
                 
             self.logger.info(f"Successfully extracted structured workflow guidance with {len(result.get('step_analysis', {}))} step analyses")
-            return result
+            
+            # Convert the detailed step_analysis to the expected positive_guidance/negative_warnings format
+            step_analysis = result.get('step_analysis', {})
+            positive_guidance = {}
+            negative_warnings = {}
+            
+            for step_name, step_data in step_analysis.items():
+                if isinstance(step_data, dict):
+                    success_patterns = step_data.get('success_patterns', '')
+                    preventive_guidance = step_data.get('preventive_guidance', '')
+                    
+                    # Combine success patterns and preventive guidance for positive guidance
+                    positive_text = f"{success_patterns} {preventive_guidance}".strip()
+                    positive_guidance[step_name] = positive_text
+                    
+                    # Use failure patterns for negative warnings
+                    failure_patterns = step_data.get('failure_patterns', '')
+                    negative_warnings[step_name] = failure_patterns
+            
+            return {
+                "positive_guidance": positive_guidance,
+                "negative_warnings": negative_warnings
+            }
             
         except Exception as e:
             self.logger.error(f"Failed to analyze similar prompts for guidance: {str(e)}")
             return {
-                "step_analysis": {
-                    "creativity_level": {"success_patterns": "", "failure_patterns": "", "impact_on_next": "", "preventive_guidance": ""},
-                    "intention_analysis": {"success_patterns": "", "failure_patterns": "", "impact_on_next": "", "preventive_guidance": ""},
-                    "prompt_refinement": {"success_patterns": "", "failure_patterns": "", "impact_on_next": "", "preventive_guidance": ""},
-                    "negative_prompt": {"success_patterns": "", "failure_patterns": "", "impact_on_next": "", "preventive_guidance": ""},
-                    "prompt_polishing": {"success_patterns": "", "failure_patterns": "", "impact_on_next": "", "preventive_guidance": ""},
-                    "generation": {"success_patterns": "", "failure_patterns": "", "impact_on_next": "", "preventive_guidance": ""},
-                    "evaluation": {"success_patterns": "", "failure_patterns": "", "impact_on_next": "", "preventive_guidance": ""}
+                "positive_guidance": {
+                    "creativity_level_determination": "",
+                    "intention_analysis": "",
+                    "prompt_refinement": "",
+                    "negative_prompt_generation": "",
+                    "prompt_polishing": "",
+                    "image_generation": "",
+                    "quality_evaluation": "",
+                    "regeneration_decision": ""
                 },
-                "workflow_insights": {
-                    "critical_dependencies": "",
-                    "common_failure_chains": "",
-                    "success_combinations": ""
+                "negative_warnings": {
+                    "creativity_level_determination": "",
+                    "intention_analysis": "",
+                    "prompt_refinement": "",
+                    "negative_prompt_generation": "",
+                    "prompt_polishing": "",
+                    "image_generation": "",
+                    "quality_evaluation": "",
+                    "regeneration_decision": ""
                 }
             }
     
@@ -1632,8 +1644,18 @@ Analyze this model's performance considering the execution flow:
 
 IMPORTANT: You will see the actual generated image(s) below. Provide specific visual analysis referencing the execution context.
 
-Return a JSON response with detailed breakdown by workflow steps:
+Return a JSON response with detailed breakdown by workflow trajectory:
 {{
+    "trajectory_reasoning": "Overall analysis of how the workflow execution played out from start to finish, including key decision points, transitions between steps, and how each step influenced the next. Analyze the logical flow and coherence of the entire process.",
+    "step_scores": {{
+        "creativity_level": "Score from 1-10 how appropriate the creativity level setting was for this specific prompt",
+        "intention_analysis": "Score from 1-10 how effective the intention analysis was for this prompt",
+        "prompt_refinement": "Score from 1-10 how well the prompt was refined for optimal generation",
+        "negative_prompt": "Score from 1-10 how effective the negative prompt was in preventing issues",
+        "prompt_polishing": "Score from 1-10 how well the prompt was optimized for this model",
+        "generation": "Score from 1-10 the overall quality of the generated image",
+        "evaluation": "Score from 1-10 how accurate the system's evaluation was"
+    }},
     "good_things": {{
         "creativity_level": "How well the creativity level setting worked for this prompt and model",
         "intention_analysis": "Effectiveness of the intention analysis in guiding the process", 
@@ -1651,15 +1673,6 @@ Return a JSON response with detailed breakdown by workflow steps:
         "prompt_polishing": "Poor model-specific optimization or prompt structure",
         "generation": "Model selection issues or generation quality problems",
         "evaluation": "Evaluation inaccuracies or scoring misalignment"
-    }},
-    "ratings": {{
-        "creativity_level": "Rate from 1-10 how appropriate the creativity level setting was for this specific prompt",
-        "intention_analysis": "Rate from 1-10 how effective the intention analysis was for this prompt",
-        "prompt_refinement": "Rate from 1-10 how well the prompt was refined for optimal generation",
-        "negative_prompt": "Rate from 1-10 how effective the negative prompt was in preventing issues",
-        "prompt_polishing": "Rate from 1-10 how well the prompt was optimized for this model",
-        "generation": "Rate from 1-10 the overall quality of the generated image",
-        "evaluation": "Rate from 1-10 how accurate the system's evaluation was"
     }},
     "overall_rating": "Rate from 1-10 the overall effectiveness of the entire workflow for this specific prompt"
 }}
@@ -1807,11 +1820,20 @@ Focus on specific observations from the actual generated image and how each work
             # Prepare common data
             common_data = {
                 'timestamp': timestamp,
+                'image_index': config_data.get('image_index', ''),
                 'original_prompt': config_data.get('prompt_understanding', {}).get('original_prompt', ''),
+                'refined_prompt': config_data.get('prompt_understanding', {}).get('refined_prompt', ''),
+                'evaluation_score': regen_config.get('evaluation_score', 0.0),
+                'confidence_score': regen_config.get('confidence_score', 0.0),
+                'regeneration_count': i,  # Current attempt number
+                'reference_image': regen_config.get('reference_content_image', ''),
+                'trajectory_reasoning': analysis.get('trajectory_reasoning', ''),
+                'step_scores': json.dumps(analysis.get('step_scores', {})) if isinstance(analysis.get('step_scores'), dict) else str(analysis.get('step_scores', {})),
                 'good_things': json.dumps(analysis.get('good_things', {})) if isinstance(analysis.get('good_things'), dict) else str(analysis.get('good_things', '')),
                 'bad_things': json.dumps(analysis.get('bad_things', {})) if isinstance(analysis.get('bad_things'), dict) else str(analysis.get('bad_things', '')),
-                'ratings': json.dumps(analysis.get('ratings', {})) if isinstance(analysis.get('ratings'), dict) else str(analysis.get('ratings', {})),
                 'overall_rating': float(analysis.get('overall_rating', 0)) if analysis.get('overall_rating') and str(analysis.get('overall_rating')).replace('.','',1).isdigit() else 0.0,
+                'config_data': json.dumps(config_data) if isinstance(config_data, dict) else str(config_data),
+                'process_summary': process_summary,
             }
             
             print(f"DEBUG: Prepared common_data for {model_name}")
@@ -1820,12 +1842,16 @@ Focus on specific observations from the actual generated image and how each work
                 print(f"DEBUG: Inserting into qwen_image_memory")
                 cursor.execute('''
                     INSERT INTO qwen_image_memory 
-                    (timestamp, original_prompt, good_things, bad_things, ratings, overall_rating)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    (timestamp, image_index, original_prompt, refined_prompt, evaluation_score, 
+                     confidence_score, regeneration_count, trajectory_reasoning, step_scores, 
+                     good_things, bad_things, overall_rating, config_data, process_summary)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
-                    common_data['timestamp'], common_data['original_prompt'],
-                    common_data['good_things'], common_data['bad_things'],
-                    common_data['ratings'], common_data['overall_rating']
+                    common_data['timestamp'], common_data['image_index'], common_data['original_prompt'],
+                    common_data['refined_prompt'], common_data['evaluation_score'], common_data['confidence_score'],
+                    common_data['regeneration_count'], common_data['trajectory_reasoning'], common_data['step_scores'],
+                    common_data['good_things'], common_data['bad_things'], common_data['overall_rating'],
+                    common_data['config_data'], common_data['process_summary']
                 ))
                 self.logger.info(f"Saved Qwen-Image memory for attempt {i+1}")
                 print(f"DEBUG: Successfully inserted into qwen_image_memory for attempt {i+1}")
@@ -1841,30 +1867,34 @@ Focus on specific observations from the actual generated image and how each work
                     self.logger.error(f"RAG index error traceback: {traceback.format_exc()}")
                 
             elif model_name == "Qwen-Image-Edit":
-                # Only save Qwen-Image-Edit memory if there was regeneration (i > 0)
-                if i > 0:
-                    print(f"DEBUG: Inserting into qwen_image_edit_memory")
-                    cursor.execute('''
-                        INSERT INTO qwen_image_edit_memory 
-                        (timestamp, original_prompt, good_things, bad_things, ratings, overall_rating)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                    ''', (
-                        common_data['timestamp'], common_data['original_prompt'],
-                        common_data['good_things'], common_data['bad_things'],
-                        common_data['ratings'], common_data['overall_rating']
-                    ))
-                    self.logger.info(f"Saved Qwen-Image-Edit memory for regeneration attempt {i+1}")
-                    print(f"DEBUG: Successfully inserted into qwen_image_edit_memory for attempt {i+1}")
-                    
-                    # Update RAG index
-                    try:
-                        self.logger.debug(f"Updating RAG index for qwen_image_edit with prompt: {common_data['original_prompt'][:50]}...")
-                        self._update_rag_index("qwen_image_edit", common_data['original_prompt'], analysis)
-                        self.logger.debug("RAG index update completed successfully for qwen_image_edit")
-                    except Exception as rag_error:
-                        self.logger.error(f"Failed to update RAG index for qwen_image_edit: {str(rag_error)}")
-                        import traceback
-                        self.logger.error(f"RAG index error traceback: {traceback.format_exc()}")
+                # Save Qwen-Image-Edit memory for all attempts (fixed: was previously only saving for i > 0)
+                print(f"DEBUG: Inserting into qwen_image_edit_memory for attempt {i+1}")
+                cursor.execute('''
+                    INSERT INTO qwen_image_edit_memory 
+                    (timestamp, image_index, original_prompt, refined_prompt, evaluation_score, 
+                     confidence_score, regeneration_count, reference_image, trajectory_reasoning, 
+                     step_scores, good_things, bad_things, overall_rating, config_data, process_summary)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    common_data['timestamp'], common_data['image_index'], common_data['original_prompt'],
+                    common_data['refined_prompt'], common_data['evaluation_score'], common_data['confidence_score'],
+                    common_data['regeneration_count'], common_data['reference_image'],
+                    common_data['trajectory_reasoning'], common_data['step_scores'],
+                    common_data['good_things'], common_data['bad_things'], common_data['overall_rating'],
+                    common_data['config_data'], common_data['process_summary']
+                ))
+                self.logger.info(f"Saved Qwen-Image-Edit memory for attempt {i+1}")
+                print(f"DEBUG: Successfully inserted into qwen_image_edit_memory for attempt {i+1}")
+                
+                # Update RAG index
+                try:
+                    self.logger.debug(f"Updating RAG index for qwen_image_edit with prompt: {common_data['original_prompt'][:50]}...")
+                    self._update_rag_index("qwen_image_edit", common_data['original_prompt'], analysis)
+                    self.logger.debug("RAG index update completed successfully for qwen_image_edit")
+                except Exception as rag_error:
+                    self.logger.error(f"Failed to update RAG index for qwen_image_edit: {str(rag_error)}")
+                    import traceback
+                    self.logger.error(f"RAG index error traceback: {traceback.format_exc()}")
         
         print(f"DEBUG: About to commit changes to database")
         conn.commit()
@@ -1892,12 +1922,6 @@ Focus on specific observations from the actual generated image and how each work
                 continue
             self._save_rag_index(model_key)
 
-    def _get_memory_guidance(self, model_name: str) -> str:
-        """Get memory guidance for model selection - now deprecated in favor of RAG guidance."""
-        # This method is deprecated since we now use RAG guidance at the beginning of the workflow
-        return ""
-
-    
     def get_model_memory_summary(self, model_name: str, limit: int = 10) -> List[Dict]:
         """Retrieve recent memory entries for a specific model."""
         try:
@@ -2305,9 +2329,11 @@ class ModelSelector:
         
         # Get RAG guidance for model selection steps  
         try:
-            prompt_refinement_guidance = config.workflow_guidance.get("step_analysis", {}).get("prompt_refinement", {}).get("success_patterns", "")
-            negative_prompt_guidance = config.workflow_guidance.get("step_analysis", {}).get("negative_prompt", {}).get("success_patterns", "")
-            generation_guidance = config.workflow_guidance.get("step_analysis", {}).get("generation", {}).get("success_patterns", "")
+            # Use guidance from the active model (default set to qwen_image at start)
+            active_guidance = get_active_guidance(config, self.logger)
+            prompt_refinement_guidance = active_guidance.get("positive_guidance", {}).get("prompt_refinement", "")
+            negative_prompt_guidance = active_guidance.get("positive_guidance", {}).get("negative_prompt_generation", "")
+            generation_guidance = active_guidance.get("positive_guidance", {}).get("image_generation", "")
         except AttributeError:
             # Handle case where workflow_guidance doesn't exist
             prompt_refinement_guidance = negative_prompt_guidance = generation_guidance = ""
@@ -2315,13 +2341,13 @@ class ModelSelector:
         # Build RAG guidance text
         rag_guidance_text = ""
         if any([prompt_refinement_guidance, negative_prompt_guidance, generation_guidance]):
-            rag_guidance_text += "\n\n=== RAG GUIDANCE FROM SIMILAR PROMPTS ===\n"
+            rag_guidance_text += "\n\n=== GUIDANCE ===\n"
             if prompt_refinement_guidance:
-                rag_guidance_text += f"PROMPT REFINEMENT INSIGHTS: {prompt_refinement_guidance}\n"
+                rag_guidance_text += f"Refinement: {prompt_refinement_guidance}\n"
             if negative_prompt_guidance:
-                rag_guidance_text += f"NEGATIVE PROMPT INSIGHTS: {negative_prompt_guidance}\n"
+                rag_guidance_text += f"Negative Prompt: {negative_prompt_guidance}\n"
             if generation_guidance:
-                rag_guidance_text += f"GENERATION INSIGHTS: {generation_guidance}\n"
+                rag_guidance_text += f"Generation: {generation_guidance}\n"
         
         # Add comprehensive workflow context
         workflow_guidance = format_workflow_guidance_text(workflow_context, include_overview=True)
@@ -2551,25 +2577,6 @@ class ModelSelector:
                 Original prompt: {config.prompt_understanding['original_prompt']}
                 Prompt understanding: {config.prompt_understanding}"""
 
-
-    def _get_memory_guidance(self, model_name: str) -> str:
-        """Get RAG-based guidance for prompt generation."""
-        global config
-        if not self.memory_manager:
-            return ""
-        
-        try:
-            # Use RAG guidance if available from config
-            if hasattr(config, 'workflow_guidance') and config.workflow_guidance:
-                guidance = config.workflow_guidance.get(f'{model_name.lower()}_guidance', '')
-                if guidance:
-                    self.logger.debug(f"Added RAG guidance for {model_name}: {guidance[:200]}...")
-                    return f"RAG-BASED GUIDANCE:\n{guidance}"
-        except Exception as e:
-            self.logger.error(f"Error getting RAG guidance: {str(e)}")
-        
-        return ""
-
     def select_model(self) -> Dict[str, Any]:
         """Analyze the refined prompt and select the most suitable model."""
         self.logger.debug("Starting model selection process")
@@ -2581,24 +2588,6 @@ class ModelSelector:
             
             self.logger.debug(f"Base system prompt length: {len(base_prompt)} characters")
             self.logger.debug(f"Task prompt length: {len(task_prompt)} characters")
-
-            # Add memory guidance for both models
-            qwen_image_guidance = self._get_memory_guidance("Qwen-Image")
-            qwen_edit_guidance = self._get_memory_guidance("Qwen-Image-Edit")
-            
-            if qwen_image_guidance or qwen_edit_guidance:
-                memory_section = "\n\n=== LEARNED PATTERNS FROM PREVIOUS RUNS ===\n"
-                if qwen_image_guidance:
-                    memory_section += f"\nFor Qwen-Image:\n{qwen_image_guidance}\n"
-                    self.logger.debug(f"Added Qwen-Image memory guidance ({len(qwen_image_guidance)} chars)")
-                if qwen_edit_guidance:
-                    memory_section += f"\nFor Qwen-Image-Edit:\n{qwen_edit_guidance}\n"
-                    self.logger.debug(f"Added Qwen-Image-Edit memory guidance ({len(qwen_edit_guidance)} chars)")
-                memory_section += "\nUse these insights to improve prompt generation and avoid common issues.\n"
-                
-                # Add memory guidance to system prompt
-                base_prompt += memory_section
-                self.logger.debug(f"Total system prompt with memory guidance: {len(base_prompt)} characters")
 
             # Log the complete model selection prompt
             self.logger.info(f"=== MODEL SELECTION - COMPLETE SYSTEM PROMPT ===")
@@ -2629,10 +2618,9 @@ class ModelSelector:
             # Ensure negative_prompt is present
             if "negative_prompt" not in result or not result["negative_prompt"]:
                 self.logger.warning("No negative prompt in model selection result, generating one...")
-                # Generate negative prompt based on the positive prompt
+                # Generate negative prompt based on the positive prompt with guidance
                 analysis = None
                 if hasattr(config, 'prompt_understanding') and config.prompt_understanding.get('prompt_analysis'):
-                    self.logger.debug("Found prompt analysis, using it for negative prompt generation")
                     try:
                         if isinstance(config.prompt_understanding['prompt_analysis'], str):
                             analysis = json.loads(config.prompt_understanding['prompt_analysis'])
@@ -2641,9 +2629,23 @@ class ModelSelector:
                     except:
                         analysis = None
                 
+                # Get RAG guidance for negative prompt generation
+                current_step = "model_selection"
+                current_substep = "negative_prompt_generation"
+                workflow_context = get_workflow_context(current_step, current_substep)
+                
+                # Get negative prompt specific guidance
+                try:
+                    active_guidance = get_active_guidance(config, self.logger)
+                    negative_prompt_guidance = active_guidance.get("positive_guidance", {}).get("negative_prompt_generation", "")
+                except AttributeError:
+                    negative_prompt_guidance = ""
+                
                 neg_result = self.negative_prompt_generator.generate_negative_prompt(
                     result.get("generating_prompt", ""), 
-                    analysis
+                    analysis,
+                    negative_prompt_guidance,
+                    workflow_context
                 )
                 result["negative_prompt"] = neg_result["negative_prompt"]
                 self.logger.info(f"Generated negative prompt: {result['negative_prompt']}")
@@ -2712,7 +2714,8 @@ def intention_understanding_node(state: MessagesState) -> Command[str]:
         creativity_workflow_context = get_workflow_context("intention", "creativity_level_determination")
         
         try:
-            creativity_guidance = config.workflow_guidance.get("step_analysis", {}).get("creativity_level", {}).get("success_patterns", "")
+            active_guidance = get_active_guidance(config, logger)
+            creativity_guidance = active_guidance.get("positive_guidance", {}).get("creativity_level_determination", "")
         except (AttributeError, TypeError):
             creativity_guidance = ""
         
@@ -2748,7 +2751,8 @@ def intention_understanding_node(state: MessagesState) -> Command[str]:
             
             # Get RAG guidance for intention analysis
             try:
-                intention_guidance = config.workflow_guidance.get("step_analysis", {}).get("intention_analysis", {}).get("success_patterns", "")
+                active_guidance = get_active_guidance(config, logger)
+                intention_guidance = active_guidance.get("positive_guidance", {}).get("intention_analysis", "")
             except (AttributeError, TypeError):
                 intention_guidance = ""
             
@@ -2779,7 +2783,8 @@ def intention_understanding_node(state: MessagesState) -> Command[str]:
                 
                 # Get RAG guidance for prompt refinement
                 try:
-                    refinement_guidance = config.workflow_guidance.get("step_analysis", {}).get("prompt_refinement", {}).get("success_patterns", "")
+                    active_guidance = get_active_guidance(config, logger)
+                    refinement_guidance = active_guidance.get("positive_guidance", {}).get("prompt_refinement", "")
                 except (AttributeError, TypeError):
                     refinement_guidance = ""
                 
@@ -2843,7 +2848,8 @@ def intention_understanding_node(state: MessagesState) -> Command[str]:
                     
                     # Get RAG guidance for prompt refinement
                     try:
-                        refinement_guidance = config.workflow_guidance.get("step_analysis", {}).get("prompt_refinement", {}).get("success_patterns", "")
+                        active_guidance = get_active_guidance(config, logger)
+                        refinement_guidance = active_guidance.get("positive_guidance", {}).get("prompt_refinement", "")
                     except (AttributeError, TypeError):
                         refinement_guidance = ""
                     
@@ -2881,7 +2887,8 @@ def intention_understanding_node(state: MessagesState) -> Command[str]:
                     
                     # Get RAG guidance for prompt refinement
                     try:
-                        refinement_guidance = config.workflow_guidance.get("step_analysis", {}).get("prompt_refinement", {}).get("success_patterns", "")
+                        active_guidance = get_active_guidance(config, logger)
+                        refinement_guidance = active_guidance.get("positive_guidance", {}).get("prompt_refinement", "")
                     except (AttributeError, TypeError):
                         refinement_guidance = ""
                     
@@ -2940,6 +2947,20 @@ def model_selection_node(state: MessagesState) -> Command[str]:
         current_config["selected_model"] = model_selection["selected_model"]
         logger.info(f"Selected model: {model_selection['selected_model']}")
         logger.info(f"Model selection reasoning: {model_selection.get('reasoning', 'No reasoning provided')}")
+        
+        # Choose which model's guidance should be active for subsequent steps
+        if current_config["selected_model"] == "Qwen-Image-Edit":
+            if config.workflow_guidance.get("qwen_image_edit"):
+                config.active_guidance_model = "qwen_image_edit"
+                logger.info("Active workflow guidance switched to Qwen-Image-Edit")
+                logger.debug(f"Edit guidance available: {len(config.workflow_guidance['qwen_image_edit'].get('positive_guidance', {}))} step analyses")
+            else:
+                logger.warning("No edit-specific guidance available, continuing with default guidance")
+                config.active_guidance_model = "qwen_image"
+        else:
+            config.active_guidance_model = "qwen_image"
+            logger.info("Active workflow guidance set to Qwen-Image")
+            logger.debug(f"Default guidance available: {len(config.workflow_guidance.get('qwen_image', {}).get('positive_guidance', {}))} step analyses")
         
         if config.regeneration_count == 0:
             # First generation - set reference content image if provided
@@ -3034,10 +3055,19 @@ def normalize_image(image):
     return image
 
 
-def polish_prompt_en(original_prompt):
-    logger.debug(f"Starting prompt polishing for: '{original_prompt[:100]}...'")
+def polish_prompt_en(original_prompt, rag_guidance="", workflow_context=None):
     
-    SYSTEM_PROMPT = '''
+    # Prepare guidance text - prioritize workflow guidance over separate RAG guidance
+    guidance_text = ""
+    # Use workflow guidance as the primary guidance source (includes processed RAG guidance)
+    if workflow_context:
+        workflow_guidance = format_workflow_guidance_text(workflow_context, include_overview=False)
+        guidance_text += f"\n\n{workflow_guidance}"
+    # Only add RAG guidance if no workflow context is available
+    elif rag_guidance:
+        guidance_text += f"\n\n=== GUIDANCE ===\n{rag_guidance}"
+    
+    SYSTEM_PROMPT = f'''
 You are a Prompt optimizer designed to rewrite user inputs into high-quality Prompts that are more complete and expressive while preserving the original meaning.
 Task Requirements:
 1. For overly brief user inputs, reasonably infer and add details to enhance the visual completeness without altering the core content;
@@ -3045,39 +3075,44 @@ Task Requirements:
 3. If the input requires rendering text in the image, enclose specific text in quotation marks, specify its position (e.g., top-left corner, bottom-right corner) and style. This text should remain unaltered and not translated;
 4. Match the Prompt to a precise, niche style aligned with the user's intent. If unspecified, choose the most appropriate style (e.g., realistic photography style);
 5. Please ensure that the Rewritten Prompt is less than 200 words.
-'''
+{guidance_text}'''
+    
     original_prompt = original_prompt.strip()
-    prompt = f"{SYSTEM_PROMPT}\n\nUser Input: {original_prompt}\n\n Rewritten Prompt:"
     magic_prompt = "Ultra HD, 4K, cinematic composition"
     
-    logger.debug(f"Polishing system prompt length: {len(SYSTEM_PROMPT)} characters")
-    logger.debug(f"Original prompt after strip: '{original_prompt}'")
-    
-    # Log the complete polishing prompt
+    # Log the complete polishing prompt with final guidance
     complete_human_prompt = f"User Input: {original_prompt}\n\n Rewritten Prompt:"
-    logger.info(f"=== PROMPT POLISHING - COMPLETE PROMPTS ===")
-    logger.info(f"System Prompt Length: {len(SYSTEM_PROMPT)} characters")
-    logger.info(f"System Prompt:\n{SYSTEM_PROMPT}")
-    logger.info(f"Human Prompt Length: {len(complete_human_prompt)} characters")
-    logger.info(f"Human Prompt:\n{complete_human_prompt}")
-    logger.info(f"=== END PROMPT POLISHING PROMPTS ===")
+    logger.debug(f"Prompt polishing - System: {len(SYSTEM_PROMPT)} chars, Human: {len(complete_human_prompt)} chars")
             
     response = track_llm_call(llm.invoke, "polish_prompt", [
                     ("system", SYSTEM_PROMPT),
                     ("human", complete_human_prompt)
                 ])
     
-    logger.debug(f"Polish response type: {type(response)}")
-    logger.debug(f"Polish response content type: {type(response.content) if hasattr(response, 'content') else 'No content attr'}")
-    
     polished_prompt = response.content.strip()
     polished_prompt = polished_prompt.replace("\n", " ")
     
     final_prompt = polished_prompt + " " + magic_prompt
-    logger.info(f"Polished prompt: '{final_prompt}'")
-    logger.debug(f"Original length: {len(original_prompt)}, Polished length: {len(final_prompt)}")
+    logger.info(f"Final polished generating prompt - COMPLETE PROMPT:")
+    logger.info(f"GENERATING: {final_prompt}")
             
     return final_prompt
+
+def get_active_guidance(config_obj, logger_obj=None) -> Dict[str, Any]:
+    """Get guidance from the currently active model (qwen_image or qwen_image_edit)."""
+    active_model_key = getattr(config_obj, "active_guidance_model", "qwen_image")
+    if logger_obj:
+        logger_obj.debug(f"Getting active guidance from model: {active_model_key}")
+    
+    if isinstance(config_obj.workflow_guidance, dict):
+        # Get guidance for the active model
+        active_guidance = config_obj.workflow_guidance.get(active_model_key, {})
+        if logger_obj:
+            logger_obj.debug(f"Active guidance has {len(active_guidance.get('positive_guidance', {}))} step analyses")
+        return active_guidance
+    if logger_obj:
+        logger_obj.warning("workflow_guidance is not a dict, returning empty guidance")
+    return {}
 
 def get_workflow_context(current_step: str, current_substep: str = "") -> Dict[str, Any]:
     """
@@ -3121,10 +3156,11 @@ def get_workflow_context(current_step: str, current_substep: str = "") -> Dict[s
         }
     }
     
-    # Get all guidance from workflow
-    step_analysis = config.workflow_guidance.get("step_analysis", {})
-    workflow_insights = config.workflow_guidance.get("workflow_insights", {})
-    logger.debug(f"Available step analysis: {list(step_analysis.keys())}")
+    # Get all guidance from the active model's workflow guidance
+    active_guidance = get_active_guidance(config, logger)
+    positive_guidance = active_guidance.get("positive_guidance", {})
+    negative_warnings = active_guidance.get("negative_warnings", {})
+    logger.debug(f"Available positive guidance: {list(positive_guidance.keys())}")
     
     # Build comprehensive context
     context = {
@@ -3142,7 +3178,10 @@ def get_workflow_context(current_step: str, current_substep: str = "") -> Dict[s
         "current_step_guidance": {},
         "upcoming_step_warnings": {},
         "remaining_steps": [],
-        "workflow_insights": workflow_insights
+        "active_guidance": {
+            "positive_guidance": positive_guidance,
+            "negative_warnings": negative_warnings
+        }
     }
     
     logger.debug(f"Current position: Step {context['current_position']['step_number']} - {context['current_position']['step_name']}")
@@ -3157,8 +3196,8 @@ def get_workflow_context(current_step: str, current_substep: str = "") -> Dict[s
         logger.debug(f"Remaining steps: {remaining_step_keys}")
         
     # Get guidance for current step
-    if current_substep in step_analysis:
-        context["current_step_guidance"] = step_analysis[current_substep]
+    if current_substep in positive_guidance:
+        context["current_step_guidance"] = {"guidance": positive_guidance[current_substep]}
         logger.debug(f"Found guidance for current substep: {current_substep}")
     
     # Get remaining steps and their warnings
@@ -3182,24 +3221,19 @@ def get_workflow_context(current_step: str, current_substep: str = "") -> Dict[s
             }
             context["remaining_steps"].append(step_data)
             
-            # Only collect guidance for immediate next steps (not current step)
-            if step_key != current_step:
-                for substep in step_info["substeps"]:
-                    if substep in step_analysis:
-                        analysis = step_analysis[substep]
-                        failure_pattern = analysis.get("failure_patterns", "")
-                        impact_on_next = analysis.get("impact_on_next", "")
-                        success_patterns = analysis.get("success_patterns", "")
-                        
-                        # Include both failure patterns and success patterns in the guidance
-                        if failure_pattern or impact_on_next or success_patterns:
-                            context["upcoming_step_warnings"][substep] = {
-                                "failure_patterns": failure_pattern,
-                                "impact_on_next": impact_on_next,
-                                "preventive_guidance": analysis.get("preventive_guidance", ""),
-                                "success_patterns": success_patterns
-                            }
-                            logger.debug(f"Found structured guidance for next step substep: {substep}")
+            # Collect guidance for all steps (including current step)
+            for substep in step_info["substeps"]:
+                if substep in negative_warnings:
+                    warning = negative_warnings[substep]
+                    positive_guid = positive_guidance.get(substep, "")
+                    
+                    # Include both warnings and positive guidance
+                    if warning or positive_guid:
+                        context["upcoming_step_warnings"][substep] = {
+                            "warnings": warning,
+                            "guidance": positive_guid
+                        }
+                        logger.debug(f"Found guidance for substep: {substep}")
     
     logger.debug(f"Total upcoming warnings found: {len(context['upcoming_step_warnings'])}")
     return context
@@ -3207,27 +3241,31 @@ def get_workflow_context(current_step: str, current_substep: str = "") -> Dict[s
 def format_workflow_guidance_text(workflow_context: Dict[str, Any], include_overview: bool = True) -> str:
     """Format workflow context into guidance text for LLM prompts.
     
-    Shows workflow overview (if requested), current position, and only guidance for the immediate next steps.
+    Shows workflow overview (if requested), current position, and guidance for all following steps.
     """
     logger.debug(f"Formatting workflow guidance text, include_overview: {include_overview}")
+    
+    # Get active guidance to access positive_guidance and negative_warnings
+    active_guidance = workflow_context.get("active_guidance", {})
+    positive_guidance = active_guidance.get("positive_guidance", {})
+    negative_warnings = active_guidance.get("negative_warnings", {})
     
     guidance_parts = []
     
     if include_overview:
         # Workflow overview
-        guidance_parts.append("=== COMPLETE WORKFLOW OVERVIEW ===")
+        guidance_parts.append("=== WORKFLOW OVERVIEW ===")
         overview = workflow_context["workflow_overview"]
-        guidance_parts.append(f"This is a {overview['total_steps']}-step image generation workflow:")
+        guidance_parts.append(f"{overview['total_steps']}-step workflow:")
         
         for i, (step_key, step_info) in enumerate(overview["steps_summary"].items(), 1):
-            guidance_parts.append(f"Step {i}: {step_info['name']} - {step_info['description']}")
+            guidance_parts.append(f"{i}. {step_info['name']}")
     
     # Current position
     current = workflow_context["current_position"]
-    guidance_parts.append(f"\n=== CURRENT POSITION ===")
-    guidance_parts.append(f"You are currently in Step {current['step_number']}: {current['step_name']}")
+    guidance_parts.append(f"\n=== CURRENT: Step {current['step_number']} - {current['step_name']} ===")
     if current["substep"]:
-        guidance_parts.append(f"Specific substep: {current['substep'].replace('_', ' ').title()}")
+        guidance_parts.append(f"Substep: {current['substep'].replace('_', ' ').title()}")
     
     # Only show information about the immediate next step
     if workflow_context["remaining_steps"]:
@@ -3253,24 +3291,22 @@ def format_workflow_guidance_text(workflow_context: Dict[str, Any], include_over
         # Display the next step if found
         if next_step_info:
             step_num = current["step_number"] + 1
-            guidance_parts.append(f"\n=== NEXT WORKFLOW STEP ===")
-            guidance_parts.append(f"Step {step_num}: {next_step_info['name']}")
-            guidance_parts.append(f"  Purpose: {next_step_info['description']}")
-            guidance_parts.append(f"  Substeps: {', '.join([s.replace('_', ' ').title() for s in next_step_info['substeps']])}")
+            guidance_parts.append(f"\n=== NEXT: Step {step_num} - {next_step_info['name']} ===")
+            guidance_parts.append(f"Substeps: {', '.join([s.replace('_', ' ').title() for s in next_step_info['substeps']])}")
     
     # Current step guidance
     if workflow_context.get("current_step_guidance"):
-        guidance_parts.append(f"\n=== CURRENT STEP GUIDANCE ===")
+        guidance_parts.append(f"\n=== GUIDANCE ===")
         guidance = workflow_context["current_step_guidance"]
         
         if guidance.get("success_patterns"):
-            guidance_parts.append(f"Success Patterns: {guidance['success_patterns']}")
+            guidance_parts.append(f"✓ Success: {guidance['success_patterns']}")
         
         if guidance.get("preventive_guidance"):
-            guidance_parts.append(f"Preventive Guidance: {guidance['preventive_guidance']}")
+            guidance_parts.append(f"⚠ Prevent: {guidance['preventive_guidance']}")
         
         if guidance.get("impact_on_next"):
-            guidance_parts.append(f"Impact on Next Step: {guidance['impact_on_next']}")
+            guidance_parts.append(f"→ Impact: {guidance['impact_on_next']}")
     
     # Show guidance for next substeps (both within current step and next step)
     if workflow_context.get("upcoming_step_warnings"):
@@ -3300,80 +3336,81 @@ def format_workflow_guidance_text(workflow_context: Dict[str, Any], include_over
             except (ValueError, IndexError):
                 remaining_current_substeps = []
         
-        # Combine remaining current substeps with next step substeps
-        all_next_substeps = remaining_current_substeps + next_step_substeps
+        # Combine current substep + remaining current substeps + next step substeps
+        all_relevant_substeps = []
+        if current_substep:
+            all_relevant_substeps.append(current_substep)
+        all_relevant_substeps.extend(remaining_current_substeps + next_step_substeps)
         
-        # Filter warnings to include both remaining current step substeps and next step substeps
+        # Filter warnings to include current substep, remaining current step substeps and next step substeps
         relevant_warnings = {}
         for substep, warning_data in workflow_context["upcoming_step_warnings"].items():
-            if substep in all_next_substeps:
+            if substep in all_relevant_substeps:
                 relevant_warnings[substep] = warning_data
         
-        if relevant_warnings:
-            guidance_parts.append(f"\n=== GUIDANCE FOR UPCOMING SUBSTEPS ===")
+        # Add comprehensive guidance for all following steps/substeps
+        if True:  # Always show guidance section
+            guidance_parts.append(f"\n=== GUIDANCE FOR FOLLOWING STEPS ===")
+            guidance_parts.append("I am providing you guidance and warnings for all upcoming steps to help you make better decisions:")
             
-            # Show remaining substeps in current step first
-            if remaining_current_substeps:
-                guidance_parts.append(f"Remaining in current step ({current['step_name']}):")
-                for substep in remaining_current_substeps:
-                    if substep in relevant_warnings:
-                        warning_data = relevant_warnings[substep]
-                        step_name = substep.replace('_', ' ').title()
-                        guidance_parts.append(f"\n{step_name}:")
-                        
-                        if warning_data.get("failure_patterns"):
-                            guidance_parts.append(f"  Common Failures: {warning_data['failure_patterns']}")
-                        
-                        if warning_data.get("impact_on_next"):
-                            guidance_parts.append(f"  Impact on Next: {warning_data['impact_on_next']}")
-                        
-                        if warning_data.get("preventive_guidance"):
-                            guidance_parts.append(f"  Prevention: {warning_data['preventive_guidance']}")
-                            
-                        if warning_data.get("recommended_rating"):
-                            guidance_parts.append(f"  Recommended Approach (1-10): {warning_data['recommended_rating']}")
+            # Get all remaining steps starting from current
+            remaining_steps = workflow_context.get("remaining_steps", [])
+            current_step_found = False
             
-            # Show next step substeps
-            if next_step_substeps and next_step_info:
-                if remaining_current_substeps:
-                    guidance_parts.append(f"\nNext step ({next_step_info['name']}):")
-                else:
-                    guidance_parts.append(f"Next step ({next_step_info['name']}):")
+            for step_info in remaining_steps:
+                step_key = step_info["key"]
+                step_name = step_info["name"]
+                substeps = step_info["substeps"]
+                
+                if step_key == current["step"]:
+                    current_step_found = True
+                
+                if current_step_found:
+                    # Always show the step header
+                    guidance_parts.append(f"\n📋 {step_name.upper()}:")
+                    step_has_content = False
                     
-                for substep in next_step_substeps:
-                    if substep in relevant_warnings:
-                        warning_data = relevant_warnings[substep]
-                        step_name = substep.replace('_', ' ').title()
-                        guidance_parts.append(f"\n{step_name}:")
+                    for substep in substeps:
+                        substep_name = substep.replace('_', ' ').title()
                         
-                        if warning_data.get("failure_patterns"):
-                            guidance_parts.append(f"  Common Failures: {warning_data['failure_patterns']}")
+                        # Add positive guidance if available
+                        positive_text = positive_guidance.get(substep, "")
+                        # Add warnings if available  
+                        warning_info = relevant_warnings.get(substep, {})
+                        warning_text = warning_info.get("warnings", "") if isinstance(warning_info, dict) else ""
                         
-                        if warning_data.get("impact_on_next"):
-                            guidance_parts.append(f"  Impact on Next: {warning_data['impact_on_next']}")
+                        # Always show substep, even if no guidance available
+                        guidance_parts.append(f"  • {substep_name}:")
+                        step_has_content = True
                         
-                        if warning_data.get("preventive_guidance"):
-                            guidance_parts.append(f"  Prevention: {warning_data['preventive_guidance']}")
-                            
-                        if warning_data.get("recommended_rating"):
-                            guidance_parts.append(f"  Recommended Approach (1-10): {warning_data['recommended_rating']}")
+                        # Always show guidance section
+                        if positive_text:
+                            guidance_parts.append(f"    ✓ GUIDANCE: {positive_text}")
+                        else:
+                            guidance_parts.append(f"    ✓ GUIDANCE: (No specific guidance available)")
+                        
+                        # Always show warning section
+                        if warning_text:
+                            guidance_parts.append(f"    ⚠️ WARNING: {warning_text}")
+                        else:
+                            guidance_parts.append(f"    ⚠️ WARNING: (No specific warnings available)")
+                    
+                    if not step_has_content:
+                        guidance_parts.append("  (No substeps available)")
+            
+            if not current_step_found:
+                guidance_parts.append("  (Current step not found in remaining steps)")
     
     # Only include relevant workflow insights
     if workflow_context.get("workflow_insights"):
         insights = workflow_context["workflow_insights"]
         relevant_insights = []
         
-        if insights.get("critical_dependencies") and next_step_info:
-            relevant_insights.append(f"Critical Dependencies: {insights['critical_dependencies']}")
-        
-        if insights.get("success_combinations") and next_step_info:
-            relevant_insights.append(f"Success Combinations: {insights['success_combinations']}")
-        
-        if insights.get("overall_rating_prediction") and next_step_info:
-            relevant_insights.append(f"Predicted Success Rating: {insights['overall_rating_prediction']}/10")
+        if insights.get("success_combinations"):
+            relevant_insights.append(f"💡 {insights['success_combinations']}")
         
         if relevant_insights:
-            guidance_parts.append(f"\n=== RELEVANT WORKFLOW INSIGHTS ===")
+            guidance_parts.append(f"\n=== KEY INSIGHTS ===")
             guidance_parts.extend(relevant_insights)
     formatted_text = "\n".join(guidance_parts)
     logger.debug(f"Generated workflow guidance text with {len(formatted_text)} characters")
@@ -3403,7 +3440,19 @@ def execute_model(model_name: str, prompt: str, negative_prompt: str, reference_
         seed = random.randint(0, 1000000)
         logger.debug(f"Generated random seed for regeneration: {seed}")
     
-    polished_prompt = polish_prompt_en(prompt)
+    # Get RAG guidance and workflow context for prompt polishing
+    current_step = "model_selection"
+    current_substep = "prompt_polishing"
+    workflow_context = get_workflow_context(current_step, current_substep)
+    
+    # Get prompt polishing specific guidance
+    try:
+        active_guidance = get_active_guidance(config, logger)
+        prompt_polishing_guidance = active_guidance.get("step_analysis", {}).get("prompt_polishing", {}).get("success_patterns", "")
+    except AttributeError:
+        prompt_polishing_guidance = ""
+    
+    polished_prompt = polish_prompt_en(prompt, prompt_polishing_guidance, workflow_context)
     
     logger.info("="*50)
     logger.info(f"MODEL EXECUTION DETAILS:")
@@ -3466,13 +3515,14 @@ def evaluation_node(state: MessagesState) -> Command[str]:
         workflow_context = get_workflow_context(current_step, current_substep)
         
         try:
-            evaluation_guidance = config.workflow_guidance.get("step_analysis", {}).get("evaluation", {}).get("success_patterns", "")
+            active_guidance = get_active_guidance(config, logger)
+            evaluation_guidance = active_guidance.get("step_analysis", {}).get("evaluation", {}).get("success_patterns", "")
         except (AttributeError, TypeError):
             evaluation_guidance = ""
         
         guidance_text = ""
         if evaluation_guidance:
-            guidance_text = f"\n\nRAG GUIDANCE FOR EVALUATION:\n{evaluation_guidance}\n\nConsider this guidance when evaluating the image."
+            guidance_text = f"\n\n=== GUIDANCE ===\n{evaluation_guidance}"
         
         # Add comprehensive workflow context
         workflow_guidance = format_workflow_guidance_text(workflow_context, include_overview=False)
@@ -3525,8 +3575,8 @@ def evaluation_node(state: MessagesState) -> Command[str]:
         logger.info(f"Evaluation result: {json.dumps(evaluation_data, indent=2)}")
         
         # Define threshold for acceptable quality
-        QUALITY_THRESHOLD = 8.0
-        MAX_REGENERATION_ATTEMPTS = 3
+        QUALITY_THRESHOLD = 9.0
+        MAX_REGENERATION_ATTEMPTS = 2
 
         # Log the evaluation score and threshold
         logger.debug(f"Evaluation score: {current_config['evaluation_score']}")
@@ -3664,17 +3714,11 @@ def run_workflow(workflow: StateGraph, initial_prompt: str):
 
 def track_llm_call(llm_func, llm_type, *args, **kwargs):
     global llm_latencies, llm_token_counts
-    logger.debug(f"Starting LLM call: {llm_type}")
-    logger.debug(f"LLM function: {llm_func}")
-    logger.debug(f"Args count: {len(args)}, Kwargs count: {len(kwargs)}")
     
     start = time.time()
     response = llm_func(*args, **kwargs)
     end = time.time()
     latency = end - start
-    
-    logger.debug(f"LLM call {llm_type} completed in {latency:.2f} seconds")
-    logger.debug(f"Response type: {type(response)}")
     
     # Try to get token usage from different possible locations
     prompt_tokens = completion_tokens = total_tokens = 0
@@ -3684,24 +3728,18 @@ def track_llm_call(llm_func, llm_type, *args, **kwargs):
         prompt_tokens = usage.get('input_tokens', 0)
         completion_tokens = usage.get('output_tokens', 0)
         total_tokens = usage.get('total_tokens', 0)
-        logger.debug(f"Found usage_metadata: input={prompt_tokens}, output={completion_tokens}, total={total_tokens}")
     # 2. openai API style
     elif hasattr(response, "usage") and response.usage:
         usage = response.usage
         prompt_tokens = usage.get('prompt_tokens', 0)
         completion_tokens = usage.get('completion_tokens', 0)
         total_tokens = usage.get('total_tokens', 0)
-        logger.debug(f"Found usage: prompt={prompt_tokens}, completion={completion_tokens}, total={total_tokens}")
     # 3. langchain_core.messages.AIMessage style (sometimes usage is in .additional_kwargs)
     elif hasattr(response, "additional_kwargs") and response.additional_kwargs:
         usage = response.additional_kwargs.get("usage", {})
         prompt_tokens = usage.get('prompt_tokens', 0)
         completion_tokens = usage.get('completion_tokens', 0)
         total_tokens = usage.get('total_tokens', 0)
-        logger.debug(f"Found additional_kwargs usage: prompt={prompt_tokens}, completion={completion_tokens}, total={total_tokens}")
-    # 4. or just 0 if not found
-    else:
-        logger.debug("No token usage information found in response")
     
     llm_latencies[llm_type].append(latency)
     llm_token_counts[llm_type].append((prompt_tokens, completion_tokens, total_tokens))
@@ -3906,53 +3944,82 @@ def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, o
             # Set the original prompt for RAG guidance retrieval
             config.prompt_understanding["original_prompt"] = text_prompt
             
-            # Retrieve RAG guidance at the beginning of the workflow
+            # Retrieve RAG guidance for both models at the beginning of the workflow
             try:
-                logger.info("Retrieving RAG workflow guidance...")
+                logger.info("="*80)
+                logger.info("RETRIEVING RAG WORKFLOW GUIDANCE")
+                logger.info("="*80)
+                logger.info(f"Current prompt: '{text_prompt}'")
                 
-                # Determine model type based on prompt content
-                model_type = "qwen_image"  # Default
-                if any(keyword in text_prompt.lower() for keyword in ["edit", "modify", "change", "adjust", "reference"]):
-                    model_type = "qwen_image_edit"
+                # Load guidance for both model types
+                qwen_image_guidance = memory_manager.get_workflow_guidance(text_prompt, "qwen_image")
+                qwen_edit_guidance = memory_manager.get_workflow_guidance(text_prompt, "qwen_image_edit")
                 
-                guidance = memory_manager.get_workflow_guidance(text_prompt, model_type)
-                logger.info(f"Guidance: {guidance}")
-                config.workflow_guidance = guidance
+                # Log COMPLETE guidance content for transparency
+                logger.info(f"\n" + "="*80)
+                logger.info(f"COMPLETE EXTRACTED GUIDANCE CONTENT")
+                logger.info(f"="*80)
+                
+                logger.info(f"\n--- QWEN-IMAGE COMPLETE GUIDANCE ---")
+                if qwen_image_guidance.get('positive_guidance'):
+                    logger.info(f"✓ Available steps: {list(qwen_image_guidance['positive_guidance'].keys())}")
+                    for step_name, guidance_text in qwen_image_guidance['positive_guidance'].items():
+                        logger.info(f"\n📋 {step_name.upper()}:")
+                        logger.info(f"   GUIDANCE: {guidance_text}")
+                        
+                    # Show negative warnings if available
+                    if qwen_image_guidance.get('negative_warnings'):
+                        logger.info(f"\n⚠️  NEGATIVE WARNINGS:")
+                        for step_name, warning_text in qwen_image_guidance['negative_warnings'].items():
+                            if warning_text.strip():
+                                logger.info(f"   {step_name}: {warning_text}")
+                else:
+                    logger.info("  ❌ No step guidance available")
+                
+                logger.info(f"\n--- QWEN-IMAGE-EDIT COMPLETE GUIDANCE ---")
+                if qwen_edit_guidance.get('positive_guidance'):
+                    logger.info(f"✓ Available steps: {list(qwen_edit_guidance['positive_guidance'].keys())}")
+                    for step_name, guidance_text in qwen_edit_guidance['positive_guidance'].items():
+                        logger.info(f"\n📋 {step_name.upper()}:")
+                        logger.info(f"   GUIDANCE: {guidance_text}")
+                        
+                    # Show negative warnings if available
+                    if qwen_edit_guidance.get('negative_warnings'):
+                        logger.info(f"\n⚠️  NEGATIVE WARNINGS:")
+                        for step_name, warning_text in qwen_edit_guidance['negative_warnings'].items():
+                            if warning_text.strip():
+                                logger.info(f"   {step_name}: {warning_text}")
+                else:
+                    logger.info("  ❌ No step guidance available")
+                
+                logger.info(f"\n" + "="*80)
+                
+                # Store both guidances in config
+                config.workflow_guidance = {
+                    "qwen_image": qwen_image_guidance,
+                    "qwen_image_edit": qwen_edit_guidance
+                }
+                # Default active guidance source
+                config.active_guidance_model = "qwen_image"
                 config.rag_guidance_retrieved = True
                 
-                logger.info("Successfully retrieved RAG workflow guidance:")
-                step_analysis = guidance.get('step_analysis', {})
-                workflow_insights = guidance.get('workflow_insights', {})
-                
-                logger.info(f"Step Analysis: {step_analysis}")
-                logger.info(f"Workflow Insights: {workflow_insights}")
-
-                logger.info(f"Step analyses available: {list(step_analysis.keys())}")
-                if workflow_insights:
-                    logger.info(f"Workflow insights: {list(workflow_insights.keys())}")
-                
-                # Log a sample of guidance for debugging
-                if step_analysis:
-                    sample_step = next(iter(step_analysis.keys()))
-                    sample_guidance = step_analysis[sample_step]
-                    logger.info(f"Sample guidance for {sample_step}: Success patterns - {sample_guidance.get('success_patterns', 'N/A')[:100]}...")
+                logger.info(f"\n--- GUIDANCE SUMMARY ---")
+                logger.info(f"Qwen-Image guidance: {len(qwen_image_guidance.get('positive_guidance', {}))} step analyses")
+                logger.info(f"Qwen-Image-Edit guidance: {len(qwen_edit_guidance.get('positive_guidance', {}))} step analyses")
+                logger.info(f"Active guidance model: {config.active_guidance_model}")
+                logger.info(f"="*80)
+                logger.info("="*80)
                 
             except Exception as e:
                 logger.error(f"Failed to retrieve RAG guidance: {str(e)}")
                 config.workflow_guidance = {
-                    "step_analysis": {
-                        "creativity_level": {"success_patterns": "", "failure_patterns": "", "impact_on_next": "", "preventive_guidance": ""},
-                        "intention_analysis": {"success_patterns": "", "failure_patterns": "", "impact_on_next": "", "preventive_guidance": ""},
-                        "prompt_refinement": {"success_patterns": "", "failure_patterns": "", "impact_on_next": "", "preventive_guidance": ""},
-                        "negative_prompt": {"success_patterns": "", "failure_patterns": "", "impact_on_next": "", "preventive_guidance": ""},
-                        "prompt_polishing": {"success_patterns": "", "failure_patterns": "", "impact_on_next": "", "preventive_guidance": ""},
-                        "generation": {"success_patterns": "", "failure_patterns": "", "impact_on_next": "", "preventive_guidance": ""},
-                        "evaluation": {"success_patterns": "", "failure_patterns": "", "impact_on_next": "", "preventive_guidance": ""}
+                    "qwen_image": {
+                        "step_analysis": {},
+                        "workflow_insights": {}
                     },
-                    "workflow_insights": {
-                        "critical_dependencies": "",
-                        "common_failure_chains": "",
-                        "success_combinations": ""
+                    "qwen_image_edit": {
+                        "step_analysis": {},
+                        "workflow_insights": {}
                     }
                 }
 
