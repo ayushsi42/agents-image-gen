@@ -394,11 +394,12 @@ Output: {
         # Construct the full system prompt with guidance
         full_system_prompt = creativity_analysis_prompt + rag_guidance_text
         
-        # Log the complete system prompt after adding guidance
-        self.logger.info(f"=== CREATIVITY LEVEL - COMPLETE SYSTEM PROMPT (with guidance) ===")
-        self.logger.info(f"Full System Prompt Length: {len(full_system_prompt)} characters")
-        self.logger.info(f"Full System Prompt:\n{full_system_prompt}")
-        self.logger.info(f"=== END CREATIVITY LEVEL PROMPT ===")
+        # === STEP 1: CREATIVITY LEVEL DETERMINATION ===
+        # Always log creativity level determination as it's a core workflow step
+        self.logger.info(f"=== STEP 1: CREATIVITY LEVEL DETERMINATION ===")
+        self.logger.info(f"System Prompt Length: {len(full_system_prompt)} characters")
+        self.logger.info(f"System Prompt:\n{full_system_prompt}")
+        self.logger.info(f"Human Prompt: Analyze this prompt and determine creativity level: '{prompt}' (Word count: {len(prompt.split())})")
 
         try:
             # Count the number of words in the prompt for additional context
@@ -433,7 +434,9 @@ Output: {
             elif word_count >= 25 and creativity_level != CreativityLevel.LOW:
                 creativity_level = CreativityLevel.LOW
                 
-            self.logger.info(f"Determined creativity level: {creativity_level.value}")
+            # === STEP 1 OUTPUT ===
+            self.logger.info(f"=== STEP 1 OUTPUT: CREATIVITY LEVEL = {creativity_level.value.upper()} ===")
+            self.logger.info(f"Reasoning: {reasoning}")
             
             return creativity_level
             
@@ -472,7 +475,7 @@ Output: {
         
         return None, None
 
-    def analyze_prompt(self, prompt: str, creativity_level: CreativityLevel, rag_guidance: str = "", workflow_context: Dict[str, Any] = None) -> Dict[str, Any]:
+    def analyze_prompt(self, prompt: str, creativity_level: CreativityLevel, workflow_context: Dict[str, Any] = None) -> Dict[str, Any]:
         """Analyze the prompt and identify elements that need clarification."""
         
         guidance_text = ""
@@ -480,20 +483,17 @@ Output: {
         if workflow_context:
             workflow_guidance = format_workflow_guidance_text(workflow_context, include_overview=True)
             guidance_text += f"\n\n{workflow_guidance}"
-        # Only add RAG guidance if no workflow context is available
-        elif rag_guidance:
-            guidance_text += f"\n\n=== GUIDANCE ===\n{rag_guidance}"
 
         image_dir_in_prompt, image_type = self.identify_image_path(prompt)
         
         base_intention_prompt = make_intention_analysis_prompt()
         complete_system_prompt = base_intention_prompt + guidance_text
         
-        # Log the complete system prompt after adding guidance
-        self.logger.info(f"=== INTENTION ANALYSIS - COMPLETE SYSTEM PROMPT (with guidance) ===")
-        self.logger.info(f"Complete System Prompt Length: {len(complete_system_prompt)} characters")
-        self.logger.info(f"Complete System Prompt:\n{complete_system_prompt}")
-        self.logger.info(f"=== END INTENTION ANALYSIS PROMPT ===")
+        # === STEP 2: INTENTION ANALYSIS ===
+        # Always log intention analysis as it's a core workflow step
+        self.logger.info(f"=== STEP 2: INTENTION ANALYSIS ===")
+        self.logger.info(f"System Prompt Length: {len(complete_system_prompt)} characters")
+        self.logger.info(f"System Prompt:\n{complete_system_prompt}")
         
         if image_dir_in_prompt:
             if image_type == "url":
@@ -560,7 +560,12 @@ Output: {
             else:
                 raise ValueError(f"Unexpected response type: {type(response)}")
                 
-            self.logger.info(f"Successfully completed prompt analysis with {len(parsed_response.get('ambiguous_elements', []))} ambiguous elements")
+            # === STEP 2 OUTPUT ===
+            ambiguous_count = len(parsed_response.get('ambiguous_elements', []))
+            self.logger.info(f"=== STEP 2 OUTPUT: ANALYZED {ambiguous_count} AMBIGUOUS ELEMENTS ===")
+            main_subjects = parsed_response.get('identified_elements', {}).get('main_subjects', [])
+            self.logger.info(f"Main Subjects: {main_subjects}")
+            
             return parsed_response
             
         except json.JSONDecodeError as e:
@@ -616,7 +621,6 @@ Output: {
                                     analysis: Dict[str, Any], 
                                     user_responses: Optional[Dict[str, str]] = None,
                                     creativity_level: CreativityLevel = CreativityLevel.MEDIUM,
-                                    rag_guidance: str = "",
                                     workflow_context: Dict[str, Any] = None
                                 ) -> Dict[str, Any]:
         """
@@ -629,24 +633,15 @@ Output: {
             - suggested_creativity_level: CreativityLevel (only when user_responses provided)
         """
         
-        # Prepare guidance text - prioritize workflow guidance over separate RAG guidance
+        # Prepare guidance text - use workflow guidance (includes processed RAG guidance)
         guidance_text = ""
         # Use workflow guidance as the primary guidance source (includes processed RAG guidance)
         if workflow_context:
             workflow_guidance = format_workflow_guidance_text(workflow_context, include_overview=False)
             guidance_text += f"\n\n{workflow_guidance}"
-        # Only add RAG guidance if no workflow context is available
-        elif rag_guidance:
-            guidance_text += f"\n\n=== GUIDANCE ===\n{rag_guidance}"
         
         if user_responses:
-            refinement_prompt = f"""
-            Original prompt: "{original_prompt}"
-            Analysis: {json.dumps(analysis, indent=2)}
-            User responses: {json.dumps(user_responses, indent=2)}
-            Current creativity level: {creativity_level.value}{guidance_text}
-            
-            You are a Qwen-Image prompt expert. Your PRIMARY GOAL is to stay faithful to the original prompt while incorporating user clarifications. CRITICAL: The refined prompt must preserve the core intent, subjects, and atmosphere of the original prompt.
+            system_prompt = f"""You are a Qwen-Image prompt expert. Your PRIMARY GOAL is to stay faithful to the original prompt while incorporating user clarifications. CRITICAL: The refined prompt must preserve the core intent, subjects, and atmosphere of the original prompt.
             
             GROUNDING PRINCIPLES:
             - PRESERVE ALL original subjects, objects, and key elements mentioned in the original prompt
@@ -677,15 +672,14 @@ Output: {
                 "refined_prompt": "A refined version that stays closely grounded to the original prompt while incorporating user clarifications. The refined prompt should read as a natural enhancement of the original, not a replacement.",
                 "suggested_creativity_level": "LOW|MEDIUM|HIGH",
                 "reasoning": "Explain why the suggested creativity level was chosen based on the detail completeness of user responses."
-            }}
-            """
-        else:
-            refinement_prompt = f"""
-            Original prompt: "{original_prompt}"
+            }}{guidance_text}"""
+            
+            human_prompt = f"""Original prompt: "{original_prompt}"
             Analysis: {json.dumps(analysis, indent=2)}
-            Creativity level: {creativity_level.value}{guidance_text}
-
-            You are a Qwen prompt expert. Your PRIMARY GOAL is to stay faithful to the original prompt while resolving ambiguities. CRITICAL: The refined prompt must preserve the core intent, subjects, and atmosphere of the original prompt.
+            User responses: {json.dumps(user_responses, indent=2)}
+            Current creativity level: {creativity_level.value}"""
+        else:
+            system_prompt = f"""You are a Qwen prompt expert. Your PRIMARY GOAL is to stay faithful to the original prompt while resolving ambiguities. CRITICAL: The refined prompt must preserve the core intent, subjects, and atmosphere of the original prompt.
             
             GROUNDING PRINCIPLES:
             - PRESERVE ALL original subjects, objects, and key elements mentioned in the original prompt
@@ -711,16 +705,24 @@ Output: {
             {{
                 "refined_prompt": "A refined version that stays closely grounded to the original prompt while resolving necessary ambiguities. The result should read as a natural clarification of the original, maintaining its core essence.",
                 "reasoning": "Explain how the refinement preserves the original prompt's intent while addressing ambiguities."
-            }}
-            """
+            }}{guidance_text}"""
+            
+            human_prompt = f"""Original prompt: "{original_prompt}"
+            Analysis: {json.dumps(analysis, indent=2)}
+            Creativity level: {creativity_level.value}"""
         
-        # Log the complete refinement prompt
-        self.logger.info(f"=== PROMPT REFINEMENT - COMPLETE SYSTEM PROMPT (with guidance) ===")
-        self.logger.info(f"Refinement Prompt Length: {len(refinement_prompt)} characters")
-        self.logger.info(f"Refinement Prompt:\n{refinement_prompt}")
-        self.logger.info(f"=== END PROMPT REFINEMENT PROMPT ===")
+        # === STEP 3: PROMPT REFINEMENT ===
+        # Always log refinement as it's a core workflow step
+        self.logger.info(f"=== STEP 3: PROMPT REFINEMENT ===")
+        self.logger.info(f"System Prompt Length: {len(system_prompt)} characters")
+        self.logger.info(f"System Prompt:\n{system_prompt}")
+        self.logger.info(f"Human Prompt Length: {len(human_prompt)} characters")
+        self.logger.info(f"Human Prompt:\n{human_prompt}")
         
-        response = track_llm_call(self.llm_json.invoke, "refine_prompt", refinement_prompt)
+        response = track_llm_call(self.llm_json.invoke, "refine_prompt", [
+            ("system", system_prompt),
+            ("human", human_prompt)
+        ])
 
         try:
             if isinstance(response.content, str):
@@ -733,8 +735,11 @@ Output: {
                 raise ValueError(f"Unexpected response type: {type(response)}")
                 
             refined_prompt = parsed_response.get('refined_prompt', 'No refined_prompt key')
-            self.logger.info(f"Successfully refined prompt - COMPLETE PROMPT:")
+            
+            # === STEP 3 OUTPUT ===
+            self.logger.info(f"=== STEP 3 OUTPUT: REFINED PROMPT ===")
             self.logger.info(f"REFINED: {refined_prompt}")
+            
             return parsed_response
             
         except json.JSONDecodeError as e:
@@ -752,7 +757,7 @@ class NegativePromptGenerator:
         self.llm_json = llm.bind(response_format={"type": "json_object"})
         self.logger = logger
 
-    def generate_negative_prompt(self, positive_prompt: str, analysis: Dict[str, Any] = None, rag_guidance: str = "", workflow_context: Dict[str, Any] = None) -> Dict[str, Any]:
+    def generate_negative_prompt(self, positive_prompt: str, analysis: Dict[str, Any] = None, workflow_context: Dict[str, Any] = None) -> Dict[str, Any]:
         """Generate a negative prompt based on the positive prompt and analysis."""
         
         guidance_text = ""
@@ -760,9 +765,6 @@ class NegativePromptGenerator:
         if workflow_context:
             workflow_guidance = format_workflow_guidance_text(workflow_context, include_overview=False)
             guidance_text += f"\n\n{workflow_guidance}"
-        # Only add RAG guidance if no workflow context is available
-        elif rag_guidance:
-            guidance_text += f"\n\n=== GUIDANCE ===\n{rag_guidance}"
         
         negative_prompt_system = """You are an expert at generating negative prompts for image generation models like Qwen-Image and Qwen-Image-Edit.
 
@@ -2327,31 +2329,9 @@ class ModelSelector:
         current_substep = "model_selection"  # This method handles the overall model selection process
         workflow_context = get_workflow_context(current_step, current_substep)
         
-        # Get RAG guidance for model selection steps  
-        try:
-            # Use guidance from the active model (default set to qwen_image at start)
-            active_guidance = get_active_guidance(config, self.logger)
-            prompt_refinement_guidance = active_guidance.get("positive_guidance", {}).get("prompt_refinement", "")
-            negative_prompt_guidance = active_guidance.get("positive_guidance", {}).get("negative_prompt_generation", "")
-            generation_guidance = active_guidance.get("positive_guidance", {}).get("image_generation", "")
-        except AttributeError:
-            # Handle case where workflow_guidance doesn't exist
-            prompt_refinement_guidance = negative_prompt_guidance = generation_guidance = ""
-        
-        # Build RAG guidance text
-        rag_guidance_text = ""
-        if any([prompt_refinement_guidance, negative_prompt_guidance, generation_guidance]):
-            rag_guidance_text += "\n\n=== GUIDANCE ===\n"
-            if prompt_refinement_guidance:
-                rag_guidance_text += f"Refinement: {prompt_refinement_guidance}\n"
-            if negative_prompt_guidance:
-                rag_guidance_text += f"Negative Prompt: {negative_prompt_guidance}\n"
-            if generation_guidance:
-                rag_guidance_text += f"Generation: {generation_guidance}\n"
-        
-        # Add comprehensive workflow context
-        workflow_guidance = format_workflow_guidance_text(workflow_context, include_overview=True)
-        rag_guidance_text += f"\n\n{workflow_guidance}"
+        # Use only workflow context (contains all necessary guidance)
+        workflow_guidance = format_workflow_guidance_text(workflow_context, include_overview=False)
+        guidance_text = f"\n\n{workflow_guidance}"
             
         if config.regeneration_count > 0:
             return f"""Select the most suitable model for the given task and generate both positive and negative prompts.
@@ -2450,7 +2430,7 @@ class ModelSelector:
                     "reasoning": "This is a new portrait generation with specific style requirements, best handled by Qwen-Image",
                     "confidence_score": 0.95
                 }}
-            """ + rag_guidance_text
+            """ + guidance_text
         else:
             return f"""Generate the most suitable prompt for the given task using Qwen-Image, including both positive and negative prompts.
             
@@ -2537,7 +2517,7 @@ class ModelSelector:
                     "reasoning": "This prompt requires generating a portrait with specific style elements while maintaining natural appearance",
                     "confidence_score": 0.95
                 }}
-            """ + rag_guidance_text
+            """ + guidance_text
 
     def _create_task_prompt(self) -> str:
         """Create the task-specific prompt based on current state."""
@@ -2589,30 +2569,29 @@ class ModelSelector:
             self.logger.debug(f"Base system prompt length: {len(base_prompt)} characters")
             self.logger.debug(f"Task prompt length: {len(task_prompt)} characters")
 
-            # Log the complete model selection prompt
-            self.logger.info(f"=== MODEL SELECTION - COMPLETE SYSTEM PROMPT ===")
-            self.logger.info(f"Final System Prompt Length: {len(base_prompt)} characters")
-            self.logger.info(f"Final System Prompt:\n{base_prompt}")
-            self.logger.info(f"=== MODEL SELECTION - TASK PROMPT ===")
+            # === STEP 4: MODEL SELECTION & NEGATIVE PROMPT ===
+            # Always log model selection as it's a core workflow step
+            self.logger.info(f"=== STEP 4: MODEL SELECTION & NEGATIVE PROMPT ===")
+            self.logger.info(f"System Prompt Length: {len(base_prompt)} characters")
+            self.logger.info(f"System Prompt:\n{base_prompt}")
             self.logger.info(f"Task Prompt Length: {len(task_prompt)} characters")  
             self.logger.info(f"Task Prompt:\n{task_prompt}")
-            self.logger.info(f"=== END MODEL SELECTION PROMPTS ===")
 
-            self.logger.info(f"Final system prompt preview: {base_prompt[:300]}...")
-            self.logger.info(f"Final task prompt: {task_prompt}")
-            
-            # Make the API call with structured prompts
             response = track_llm_call(self.llm_json.invoke, "model_selection", [
                 ("system", base_prompt),
                 ("human", task_prompt)
             ])
 
-            self.logger.debug(f"Model selection response type: {type(response)}")
-            self.logger.debug(f"Model selection response length: {len(str(response))}")
+            result = self._parse_llm_response(response)            # === STEP 4 OUTPUT ===
+            selected_model = result.get('selected_model', 'Unknown')
+            generating_prompt = result.get('generating_prompt', '')
+            negative_prompt = result.get('negative_prompt', '')
             
-            result = self._parse_llm_response(response)
+            self.logger.info(f"=== STEP 4 OUTPUT: MODEL & PROMPTS ===")
+            self.logger.info(f"Selected Model: {selected_model}")
+            self.logger.info(f"Generating Prompt: {generating_prompt}")
+            self.logger.info(f"Negative Prompt: {negative_prompt}")
             
-            self.logger.info(f"Model selection successful - Selected: {result.get('selected_model', 'Unknown')}")
             self.logger.debug(f"Model selection result keys: {list(result.keys()) if isinstance(result, dict) else 'Not a dict'}")
             
             # Ensure negative_prompt is present
@@ -2634,17 +2613,9 @@ class ModelSelector:
                 current_substep = "negative_prompt_generation"
                 workflow_context = get_workflow_context(current_step, current_substep)
                 
-                # Get negative prompt specific guidance
-                try:
-                    active_guidance = get_active_guidance(config, self.logger)
-                    negative_prompt_guidance = active_guidance.get("positive_guidance", {}).get("negative_prompt_generation", "")
-                except AttributeError:
-                    negative_prompt_guidance = ""
-                
                 neg_result = self.negative_prompt_generator.generate_negative_prompt(
                     result.get("generating_prompt", ""), 
                     analysis,
-                    negative_prompt_guidance,
                     workflow_context
                 )
                 result["negative_prompt"] = neg_result["negative_prompt"]
@@ -2713,32 +2684,15 @@ def intention_understanding_node(state: MessagesState) -> Command[str]:
         # Get workflow context for creativity level determination
         creativity_workflow_context = get_workflow_context("intention", "creativity_level_determination")
         
-        try:
-            active_guidance = get_active_guidance(config, logger)
-            creativity_guidance = active_guidance.get("positive_guidance", {}).get("creativity_level_determination", "")
-        except (AttributeError, TypeError):
-            creativity_guidance = ""
-        
-        if creativity_guidance:
-            logger.info(f"RAG Guidance for Creativity Level: {creativity_guidance}")
-        
-        # Add workflow guidance to creativity guidance
-        creativity_guidance_with_context = creativity_guidance
+        # Use workflow context directly (contains all necessary guidance)
         if creativity_workflow_context:
             workflow_guidance = format_workflow_guidance_text(creativity_workflow_context, include_overview=True)
-            creativity_guidance_with_context += f"\n\n{workflow_guidance}"
-            logger.info(f"=== CREATIVITY LEVEL - COMBINED GUIDANCE ===")
-            logger.info(f"RAG Guidance Length: {len(creativity_guidance)} characters")
-            logger.info(f"Workflow Context Length: {len(workflow_guidance)} characters")
-            logger.info(f"Total Combined Length: {len(creativity_guidance_with_context)} characters")
-            logger.info(f"Combined Guidance:\n{creativity_guidance_with_context}")
-            logger.info(f"=== END CREATIVITY LEVEL COMBINED GUIDANCE ===")
-        
-        # Determine creativity level based on prompt analysis with RAG guidance and workflow context
-        determined_creativity_level = analyzer.determine_creativity_level(
-            last_message.content, 
-            rag_guidance=creativity_guidance_with_context
-        )
+            
+            # Determine creativity level using only workflow context (will log complete system prompt)
+            determined_creativity_level = analyzer.determine_creativity_level(
+                last_message.content, 
+                rag_guidance=workflow_guidance
+            )
         config.prompt_understanding["creativity_level"] = determined_creativity_level
         logger.info(f"Determined creativity level: {determined_creativity_level.value}")
         
@@ -2749,21 +2703,10 @@ def intention_understanding_node(state: MessagesState) -> Command[str]:
             current_substep = "intention_analysis"
             workflow_context = get_workflow_context(current_step, current_substep)
             
-            # Get RAG guidance for intention analysis
-            try:
-                active_guidance = get_active_guidance(config, logger)
-                intention_guidance = active_guidance.get("positive_guidance", {}).get("intention_analysis", "")
-            except (AttributeError, TypeError):
-                intention_guidance = ""
-            
-            if intention_guidance:
-                logger.info(f"RAG Guidance for Intention Analysis: {intention_guidance}")
-            
-            # Analyze prompt with RAG guidance and workflow context
+            # Analyze prompt with workflow context
             analysis = analyzer.analyze_prompt(
                 last_message.content, 
                 config.prompt_understanding["creativity_level"],
-                rag_guidance=intention_guidance,
                 workflow_context=workflow_context
             )
             config.prompt_understanding["prompt_analysis"] = json.dumps(analysis)
@@ -2781,23 +2724,14 @@ def intention_understanding_node(state: MessagesState) -> Command[str]:
                 # Get workflow context for prompt refinement  
                 refinement_workflow_context = get_workflow_context("intention", "prompt_refinement")
                 
-                # Get RAG guidance for prompt refinement
-                try:
-                    active_guidance = get_active_guidance(config, logger)
-                    refinement_guidance = active_guidance.get("positive_guidance", {}).get("prompt_refinement", "")
-                except (AttributeError, TypeError):
-                    refinement_guidance = ""
-                
-                # Refine prompt directly with RAG guidance and workflow context
+                # Refine prompt directly with workflow context
                 refinement_result = analyzer.refine_prompt_with_analysis(
                     last_message.content,
                     analysis,
                     creativity_level=config.prompt_understanding["creativity_level"],
-                    rag_guidance=refinement_guidance,
                     workflow_context=refinement_workflow_context
                 )
                 config.prompt_understanding["refined_prompt"] = refinement_result['refined_prompt']
-                logger.info(f"With SUFFICIENT_DETAIL, AUTOCOMPLETE, or non-human-in-loop mode, Refinement result: {json.dumps(refinement_result, indent=2)}")
                 
                 command = Command(
                                 update={"messages": state["messages"] + [AIMessage(content=f"Refined prompt: {config.prompt_understanding['refined_prompt']}")]},
@@ -2846,20 +2780,12 @@ def intention_understanding_node(state: MessagesState) -> Command[str]:
                     # Get workflow context for prompt refinement
                     refinement_workflow_context = get_workflow_context("intention", "prompt_refinement")
                     
-                    # Get RAG guidance for prompt refinement
-                    try:
-                        active_guidance = get_active_guidance(config, logger)
-                        refinement_guidance = active_guidance.get("positive_guidance", {}).get("prompt_refinement", "")
-                    except (AttributeError, TypeError):
-                        refinement_guidance = ""
-                    
-                    # Refine prompt with user input, RAG guidance, and workflow context
+                    # Refine prompt with user input and workflow context
                     refinement_result = analyzer.refine_prompt_with_analysis(
                         config.prompt_understanding['original_prompt'],
                         analysis,
                         user_responses,
                         config.prompt_understanding["creativity_level"],
-                        rag_guidance=refinement_guidance,
                         workflow_context=refinement_workflow_context
                     )
                     config.prompt_understanding["refined_prompt"] = refinement_result['refined_prompt']
@@ -2872,8 +2798,6 @@ def intention_understanding_node(state: MessagesState) -> Command[str]:
                             config.prompt_understanding["creativity_level"] = CreativityLevel.HIGH
                         logger.info(f"Update creativity level to {config.prompt_understanding['creativity_level']}")
                     
-                    logger.info(f"Final refinement result: {json.dumps(refinement_result, indent=2)}")
-                    
                     command = Command(
                                     update={"messages": state["messages"] + [AIMessage(content=f" User provides clarification. Refined prompt: {config.prompt_understanding['refined_prompt']}")]},
                                     goto="model_selection"
@@ -2885,22 +2809,19 @@ def intention_understanding_node(state: MessagesState) -> Command[str]:
                     # Get workflow context for prompt refinement  
                     refinement_workflow_context = get_workflow_context("intention", "prompt_refinement")
                     
-                    # Get RAG guidance for prompt refinement
-                    try:
-                        active_guidance = get_active_guidance(config, logger)
-                        refinement_guidance = active_guidance.get("positive_guidance", {}).get("prompt_refinement", "")
-                    except (AttributeError, TypeError):
-                        refinement_guidance = ""
-                    
                     refinement_result = analyzer.refine_prompt_with_analysis(
                         last_message.content,
                         analysis,
                         creativity_level=CreativityLevel.HIGH,
-                        rag_guidance=refinement_guidance,
                         workflow_context=refinement_workflow_context
                     )
                     config.prompt_understanding["refined_prompt"] = refinement_result['refined_prompt']
-                    logger.info(f"Auto-refinement result (non-human-in-loop): {json.dumps(refinement_result, indent=2)}")
+                    
+                    # Log auto-refinement output
+                    logger.info("=== STEP 3 OUTPUT (Auto-refinement): ===")
+                    logger.info(f"Refined Prompt: {refinement_result['refined_prompt']}")
+                    if 'reasoning' in refinement_result:
+                        logger.info(f"Reasoning: {refinement_result['reasoning']}")
                     
                     command = Command(
                                     update={"messages": state["messages"] + [AIMessage(content=f"LLM Refined prompt: {config.prompt_understanding['refined_prompt']}")]},
@@ -2982,6 +2903,14 @@ def model_selection_node(state: MessagesState) -> Command[str]:
         current_config["reasoning"] = model_selection["reasoning"]
         current_config["confidence_score"] = model_selection["confidence_score"]
 
+        # === STEP 6: IMAGE GENERATION ===
+        logger.info(f"=== STEP 6: IMAGE GENERATION ===")
+        logger.info(f"Model: {current_config['selected_model']}")
+        logger.info(f"Generating Prompt: {current_config['generating_prompt']}")
+        logger.info(f"Negative Prompt: {current_config['negative_prompt']}")
+        if current_config.get('reference_content_image'):
+            logger.info(f"Reference Image: {current_config['reference_content_image']}")
+
         # Execute the selected model with negative prompt
         gen_image_path = execute_model(
             model_name=current_config['selected_model'],
@@ -2992,6 +2921,11 @@ def model_selection_node(state: MessagesState) -> Command[str]:
         
         current_config["gen_image_path"] = gen_image_path
 
+        # Log generation output
+        logger.info(f"=== STEP 6 OUTPUT: IMAGE GENERATED ===")
+        logger.info(f"Generated Image Path: {gen_image_path}")
+        logger.info(f"Model Used: {current_config['selected_model']}")
+        
         command = Command(
             update={"messages": state["messages"] + [
                 AIMessage(content=f"Generated images using {current_config['selected_model']}. "
@@ -3055,17 +2989,14 @@ def normalize_image(image):
     return image
 
 
-def polish_prompt_en(original_prompt, rag_guidance="", workflow_context=None):
+def polish_prompt_en(original_prompt, workflow_context=None):
     
-    # Prepare guidance text - prioritize workflow guidance over separate RAG guidance
+    # Prepare guidance text - use workflow guidance (includes processed RAG guidance)
     guidance_text = ""
     # Use workflow guidance as the primary guidance source (includes processed RAG guidance)
     if workflow_context:
         workflow_guidance = format_workflow_guidance_text(workflow_context, include_overview=False)
         guidance_text += f"\n\n{workflow_guidance}"
-    # Only add RAG guidance if no workflow context is available
-    elif rag_guidance:
-        guidance_text += f"\n\n=== GUIDANCE ===\n{rag_guidance}"
     
     SYSTEM_PROMPT = f'''
 You are a Prompt optimizer designed to rewrite user inputs into high-quality Prompts that are more complete and expressive while preserving the original meaning.
@@ -3082,7 +3013,13 @@ Task Requirements:
     
     # Log the complete polishing prompt with final guidance
     complete_human_prompt = f"User Input: {original_prompt}\n\n Rewritten Prompt:"
-    logger.debug(f"Prompt polishing - System: {len(SYSTEM_PROMPT)} chars, Human: {len(complete_human_prompt)} chars")
+    
+    # === STEP 5: PROMPT POLISHING ===
+    # Always log prompt polishing as it's a core workflow step
+    logger.info(f"=== STEP 5: PROMPT POLISHING ===")
+    logger.info(f"System Prompt Length: {len(SYSTEM_PROMPT)} characters")
+    logger.info(f"System Prompt:\n{SYSTEM_PROMPT}")
+    logger.info(f"Human Prompt: User Input: {original_prompt}")
             
     response = track_llm_call(llm.invoke, "polish_prompt", [
                     ("system", SYSTEM_PROMPT),
@@ -3093,8 +3030,10 @@ Task Requirements:
     polished_prompt = polished_prompt.replace("\n", " ")
     
     final_prompt = polished_prompt + " " + magic_prompt
-    logger.info(f"Final polished generating prompt - COMPLETE PROMPT:")
-    logger.info(f"GENERATING: {final_prompt}")
+    
+    # === STEP 5 OUTPUT ===
+    logger.info(f"=== STEP 5 OUTPUT: POLISHED PROMPT ===")
+    logger.info(f"FINAL: {final_prompt}")
             
     return final_prompt
 
@@ -3379,6 +3318,11 @@ def format_workflow_guidance_text(workflow_context: Dict[str, Any], include_over
                         warning_info = relevant_warnings.get(substep, {})
                         warning_text = warning_info.get("warnings", "") if isinstance(warning_info, dict) else ""
                         
+                        # Debug: Check if we have warnings in negative_warnings but not in relevant_warnings
+                        direct_warning = negative_warnings.get(substep, "")
+                        if direct_warning and not warning_text:
+                            logger.debug(f"Warning mismatch for {substep}: direct='{direct_warning[:50]}...', filtered='{warning_text}'")
+                        
                         # Always show substep, even if no guidance available
                         guidance_parts.append(f"  • {substep_name}:")
                         step_has_content = True
@@ -3389,9 +3333,10 @@ def format_workflow_guidance_text(workflow_context: Dict[str, Any], include_over
                         else:
                             guidance_parts.append(f"    ✓ GUIDANCE: (No specific guidance available)")
                         
-                        # Always show warning section
-                        if warning_text:
-                            guidance_parts.append(f"    ⚠️ WARNING: {warning_text}")
+                        # Always show warning section - use direct warning if available
+                        display_warning = warning_text or direct_warning
+                        if display_warning:
+                            guidance_parts.append(f"    ⚠️ WARNING: {display_warning}")
                         else:
                             guidance_parts.append(f"    ⚠️ WARNING: (No specific warnings available)")
                     
@@ -3445,14 +3390,7 @@ def execute_model(model_name: str, prompt: str, negative_prompt: str, reference_
     current_substep = "prompt_polishing"
     workflow_context = get_workflow_context(current_step, current_substep)
     
-    # Get prompt polishing specific guidance
-    try:
-        active_guidance = get_active_guidance(config, logger)
-        prompt_polishing_guidance = active_guidance.get("step_analysis", {}).get("prompt_polishing", {}).get("success_patterns", "")
-    except AttributeError:
-        prompt_polishing_guidance = ""
-    
-    polished_prompt = polish_prompt_en(prompt, prompt_polishing_guidance, workflow_context)
+    polished_prompt = polish_prompt_en(prompt, workflow_context)
     
     logger.info("="*50)
     logger.info(f"MODEL EXECUTION DETAILS:")
