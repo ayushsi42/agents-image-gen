@@ -11,7 +11,7 @@ import numpy as np
 from transformers import AutoModel
 import torch
 
-NODE_MODEL_SELECTION = "model_selection"
+NODE_MODEL_SELECTION = "negative_model_selection"
 NODE_EVALUATION = "evaluation"
 from datetime import datetime
 from langchain_core.tools import tool
@@ -99,7 +99,7 @@ class T2IConfig:
         # RAG-based workflow guidance
         self.workflow_guidance = {
             "positive_guidance": {},  # What worked well for similar prompts
-            "negative_warnings": {}   # What to avoid based on similar prompt failures
+            "unsuccessful_patterns": {}   # What to avoid based on similar prompt failures
         }
         
         # RAG guidance retrieval flag
@@ -307,21 +307,16 @@ class IntentionAnalyzer:
         self.llm_json = llm.bind(response_format={"type": "json_object"})
         self.logger = logger
 
-    def determine_creativity_level(self, prompt: str, rag_guidance: str = "") -> CreativityLevel:
+    def determine_creativity_level(self, prompt: str, workflow_context: Dict[str, Any] = None) -> CreativityLevel:
         """Analyze the prompt to automatically determine the appropriate creativity level."""
         
-        # Include RAG guidance in the analysis prompt
-        rag_guidance_text = ""
-        if rag_guidance:
-            # Check if rag_guidance already contains workflow guidance (which has its own GUIDANCE header)
-            if "=== GUIDANCE ===" in rag_guidance:
-                # Already formatted with guidance headers, use as-is
-                rag_guidance_text = f"\n\n{rag_guidance}"
-            else:
-                # Simple RAG guidance without workflow context, add header
-                rag_guidance_text = f"\n\n=== GUIDANCE ===\n{rag_guidance}"
+        # Include workflow context guidance in the analysis prompt
+        guidance_text = ""
+        if workflow_context:
+            workflow_guidance = format_workflow_guidance_text(workflow_context, include_overview=True)
+            guidance_text = f"\n\n{workflow_guidance}"
         
-        creativity_analysis_prompt = """You are an expert at analyzing image generation prompts to determine the appropriate creativity level.
+        base_creativity_analysis_prompt = """You are an expert at analyzing image generation prompts to determine the appropriate creativity level.
 
 The PRIMARY RULE for assessing creativity level is: Shorter and less informed prompts require HIGH creativity to detailed and well-specified prompts require LOW creativity.
 
@@ -348,7 +343,7 @@ LOW Creativity Level (stick closely to specifications):
 - Prompts that explicitly specify style, composition, colors, lighting, background, and other details
 - Professional or commercial image requests with clear technical specifications
 - Prompts that leave very little room for creative interpretation
-- Word count typically over 25 words with numerous specific details""" + rag_guidance_text + """
+- Word count typically over 25 words with numerous specific details
 
 Return JSON with:
 {
@@ -391,8 +386,8 @@ Output: {
     "prompt_characteristics": {"detail_level": "high", "specificity": "precise", "artistic_freedom": "constrained"}
 }"""
 
-        # Construct the full system prompt with guidance
-        full_system_prompt = creativity_analysis_prompt + rag_guidance_text
+        # Construct the full system prompt with guidance BEFORE the system prompt
+        full_system_prompt = guidance_text + "\n\n" + base_creativity_analysis_prompt
         
         # === STEP 1: CREATIVITY LEVEL DETERMINATION ===
         # Always log creativity level determination as it's a core workflow step
@@ -487,7 +482,7 @@ Output: {
         image_dir_in_prompt, image_type = self.identify_image_path(prompt)
         
         base_intention_prompt = make_intention_analysis_prompt()
-        complete_system_prompt = base_intention_prompt + guidance_text
+        complete_system_prompt = guidance_text + "\n\n" + base_intention_prompt
         
         # === STEP 2: INTENTION ANALYSIS ===
         # Always log intention analysis as it's a core workflow step
@@ -641,7 +636,7 @@ Output: {
             guidance_text += f"\n\n{workflow_guidance}"
         
         if user_responses:
-            system_prompt = f"""You are a Qwen-Image prompt expert. Your PRIMARY GOAL is to stay faithful to the original prompt while incorporating user clarifications. CRITICAL: The refined prompt must preserve the core intent, subjects, and atmosphere of the original prompt.
+            base_system_prompt = """You are a Qwen-Image prompt expert. Your PRIMARY GOAL is to stay faithful to the original prompt while incorporating user clarifications. CRITICAL: The refined prompt must preserve the core intent, subjects, and atmosphere of the original prompt.
             
             GROUNDING PRINCIPLES:
             - PRESERVE ALL original subjects, objects, and key elements mentioned in the original prompt
@@ -668,18 +663,21 @@ Output: {
                - HIGH: If many details are still open to interpretation
             
             Return a JSON with:
-            {{
+            {
                 "refined_prompt": "A refined version that stays closely grounded to the original prompt while incorporating user clarifications. The refined prompt should read as a natural enhancement of the original, not a replacement.",
                 "suggested_creativity_level": "LOW|MEDIUM|HIGH",
                 "reasoning": "Explain why the suggested creativity level was chosen based on the detail completeness of user responses."
-            }}{guidance_text}"""
+            }"""
+            
+            # Construct system prompt with guidance BEFORE the system prompt
+            system_prompt = guidance_text + "\n\n" + base_system_prompt
             
             human_prompt = f"""Original prompt: "{original_prompt}"
             Analysis: {json.dumps(analysis, indent=2)}
             User responses: {json.dumps(user_responses, indent=2)}
             Current creativity level: {creativity_level.value}"""
         else:
-            system_prompt = f"""You are a Qwen prompt expert. Your PRIMARY GOAL is to stay faithful to the original prompt while resolving ambiguities. CRITICAL: The refined prompt must preserve the core intent, subjects, and atmosphere of the original prompt.
+            base_system_prompt = """You are a Qwen prompt expert. Your PRIMARY GOAL is to stay faithful to the original prompt while resolving ambiguities. CRITICAL: The refined prompt must preserve the core intent, subjects, and atmosphere of the original prompt.
             
             GROUNDING PRINCIPLES:
             - PRESERVE ALL original subjects, objects, and key elements mentioned in the original prompt
@@ -702,10 +700,13 @@ Output: {
             5. If there is reference image, must keep the its directory
             
             Return a JSON with:
-            {{
+            {
                 "refined_prompt": "A refined version that stays closely grounded to the original prompt while resolving necessary ambiguities. The result should read as a natural clarification of the original, maintaining its core essence.",
                 "reasoning": "Explain how the refinement preserves the original prompt's intent while addressing ambiguities."
-            }}{guidance_text}"""
+            }"""
+            
+            # Construct system prompt with guidance BEFORE the system prompt
+            system_prompt = guidance_text + "\n\n" + base_system_prompt
             
             human_prompt = f"""Original prompt: "{original_prompt}"
             Analysis: {json.dumps(analysis, indent=2)}
@@ -766,7 +767,7 @@ class NegativePromptGenerator:
             workflow_guidance = format_workflow_guidance_text(workflow_context, include_overview=False)
             guidance_text += f"\n\n{workflow_guidance}"
         
-        negative_prompt_system = """You are an expert at generating negative prompts for image generation models like Qwen-Image and Qwen-Image-Edit.
+        base_negative_prompt_system = """You are an expert at generating negative prompts for image generation models like Qwen-Image and Qwen-Image-Edit.
 
 A negative prompt specifies what should NOT appear in the generated image. It helps avoid common issues like:
 - Poor quality artifacts (blurry, distorted, low quality, pixelated)
@@ -791,7 +792,10 @@ Examples:
 - Portrait: "blurry, low quality, distorted face, multiple heads, extra limbs, watermark, text"
 - Landscape: "people, buildings, text, watermark, low quality, blurry, oversaturated"
 - Fantasy scene: "modern objects, realistic style, low quality, blurry, watermark, text"
-""" + guidance_text
+"""
+
+        # Construct system prompt with guidance BEFORE the system prompt
+        negative_prompt_system = guidance_text + "\n\n" + base_negative_prompt_system
 
         if analysis:
             analysis_text = f"\nPrompt analysis context: {json.dumps(analysis, indent=2)}"
@@ -1141,7 +1145,7 @@ class MemoryManager:
                         "generation": "",
                         "evaluation": ""
                     },
-                    "negative_warnings": {
+                    "unsuccessful_patterns": {
                         "creativity_level": "",
                         "intention_analysis": "",
                         "prompt_refinement": "",
@@ -1165,7 +1169,7 @@ class MemoryManager:
                         "generation": "",
                         "evaluation": ""
                     },
-                    "negative_warnings": {
+                    "unsuccessful_patterns": {
                         "creativity_level": "",
                         "intention_analysis": "",
                         "prompt_refinement": "",
@@ -1213,7 +1217,7 @@ class MemoryManager:
                     "generation": "",
                     "evaluation": ""
                 },
-                "negative_warnings": {
+                "unsuccessful_patterns": {
                     "creativity_level": "",
                     "intention_analysis": "",
                     "prompt_refinement": "",
@@ -1284,7 +1288,7 @@ class MemoryManager:
                     })
             
             if not analysis_data:
-                return {"positive_guidance": {}, "negative_warnings": {}}
+                return {"positive_guidance": {}, "unsuccessful_patterns": {}}
             
             # Create prompt for LLM analysis with improved structure for better pattern recognition
             similar_data_text = ""
@@ -1344,7 +1348,7 @@ SIMILAR PROMPTS DATA:
 
 WORKFLOW STRUCTURE:
 Step 1: CREATIVITY_LEVEL → Step 2: INTENTION_ANALYSIS → Step 3: PROMPT_REFINEMENT → 
-Step 4: NEGATIVE_PROMPT → Step 5: PROMPT_POLISHING → Step 6: GENERATION → Step 7: EVALUATION
+Step 4: NEGATIVE_MODEL_SELECTION → Step 5: PROMPT_POLISHING → Step 6: GENERATION → Step 7: EVALUATION
 
 INSTRUCTIONS:
 1. Analyze the SPECIFIC techniques, parameters, and approaches that led to success or failure in similar prompts
@@ -1378,11 +1382,11 @@ Return JSON with this EXACT structure:
             "preventive_guidance": "DETAILED advice with SPECIFIC refinement techniques",
             "recommended_score": "Recommend target score (1-10) based on similar examples"
         }},
-        "negative_prompt_generation": {{
-            "success_patterns": "SPECIFIC negative prompt elements that were effective for this subject",
-            "failure_patterns": "SPECIFIC negative prompt issues observed in similar cases",
+        "negative_model_selection": {{
+            "success_patterns": "SPECIFIC negative prompt and model selection strategies that were effective for this subject",
+            "failure_patterns": "SPECIFIC negative prompt and model selection issues observed in similar cases",
             "impact_on_next": "CONCRETE impact on prompt polishing",
-            "preventive_guidance": "DETAILED advice with SPECIFIC terms to include/exclude",
+            "preventive_guidance": "DETAILED advice with SPECIFIC negative prompt terms and model selection criteria",
             "recommended_score": "Recommend target score (1-10) based on similar examples"
         }},
         "prompt_polishing": {{
@@ -1450,10 +1454,10 @@ Instead provide domain-specific, technical recommendations based on the actual e
                 
             self.logger.info(f"Successfully extracted structured workflow guidance with {len(result.get('step_analysis', {}))} step analyses")
             
-            # Convert the detailed step_analysis to the expected positive_guidance/negative_warnings format
+            # Convert the detailed step_analysis to the expected positive_guidance/unsuccessful_patterns format
             step_analysis = result.get('step_analysis', {})
             positive_guidance = {}
-            negative_warnings = {}
+            unsuccessful_patterns = {}
             
             for step_name, step_data in step_analysis.items():
                 if isinstance(step_data, dict):
@@ -1464,13 +1468,13 @@ Instead provide domain-specific, technical recommendations based on the actual e
                     positive_text = f"{success_patterns} {preventive_guidance}".strip()
                     positive_guidance[step_name] = positive_text
                     
-                    # Use failure patterns for negative warnings
+                    # Use failure patterns for unsuccessful patterns
                     failure_patterns = step_data.get('failure_patterns', '')
-                    negative_warnings[step_name] = failure_patterns
+                    unsuccessful_patterns[step_name] = failure_patterns
             
             return {
                 "positive_guidance": positive_guidance,
-                "negative_warnings": negative_warnings
+                "unsuccessful_patterns": unsuccessful_patterns
             }
             
         except Exception as e:
@@ -1480,17 +1484,17 @@ Instead provide domain-specific, technical recommendations based on the actual e
                     "creativity_level_determination": "",
                     "intention_analysis": "",
                     "prompt_refinement": "",
-                    "negative_prompt_generation": "",
+                    "negative_model_selection": "",
                     "prompt_polishing": "",
                     "image_generation": "",
                     "quality_evaluation": "",
                     "regeneration_decision": ""
                 },
-                "negative_warnings": {
+                "unsuccessful_patterns": {
                     "creativity_level_determination": "",
                     "intention_analysis": "",
                     "prompt_refinement": "",
-                    "negative_prompt_generation": "",
+                    "negative_model_selection": "",
                     "prompt_polishing": "",
                     "image_generation": "",
                     "quality_evaluation": "",
@@ -2326,19 +2330,19 @@ class ModelSelector:
         """Create the system prompt with all examples and guidelines."""
         # Get comprehensive workflow context
         current_step = "model_selection"
-        current_substep = "model_selection"  # This method handles the overall model selection process
-        workflow_context = get_workflow_context(current_step, current_substep)
+        current_substep = "negative_model_selection"  # This method handles the overall negative prompt and model selection process
+        workflow_context = get_workflow_context(current_step, current_substep, config_obj=config)
         
         # Use only workflow context (contains all necessary guidance)
         workflow_guidance = format_workflow_guidance_text(workflow_context, include_overview=False)
         guidance_text = f"\n\n{workflow_guidance}"
             
         if config.regeneration_count > 0:
-            return f"""Select the most suitable model for the given task and generate both positive and negative prompts.
+            base_system_prompt = """Select the most suitable model for the given task and generate both positive and negative prompts.
             
             Available models:
-            1. Qwen-Image: {self.available_models['Qwen-Image']}
-            2. Qwen-Image-Edit: {self.available_models['Qwen-Image-Edit']}
+            1. Qwen-Image: {qwen_image_desc}
+            2. Qwen-Image-Edit: {qwen_edit_desc}
 
             Note:
             - Best cases for selecting Qwen-Image:
@@ -2430,11 +2434,17 @@ class ModelSelector:
                     "reasoning": "This is a new portrait generation with specific style requirements, best handled by Qwen-Image",
                     "confidence_score": 0.95
                 }}
-            """ + guidance_text
-        else:
-            return f"""Generate the most suitable prompt for the given task using Qwen-Image, including both positive and negative prompts.
+            """
             
-            # Qwen-Image: {self.available_models['Qwen-Image']}
+            # Construct system prompt with guidance BEFORE the base prompt
+            return guidance_text + "\n\n" + base_system_prompt.format(
+                qwen_image_desc=self.available_models['Qwen-Image'],
+                qwen_edit_desc=self.available_models['Qwen-Image-Edit']
+            )
+        else:
+            base_else_system_prompt = """Generate the most suitable prompt for the given task using Qwen-Image, including both positive and negative prompts.
+            
+            # Qwen-Image: {qwen_image_desc}
 
             Guidelines for generating_prompt:
             - CRITICAL: Stay faithful to the original prompt's core intent, subjects, and atmosphere
@@ -2517,7 +2527,12 @@ class ModelSelector:
                     "reasoning": "This prompt requires generating a portrait with specific style elements while maintaining natural appearance",
                     "confidence_score": 0.95
                 }}
-            """ + guidance_text
+            """
+            
+            # Construct system prompt with guidance BEFORE the base prompt
+            return guidance_text + "\n\n" + base_else_system_prompt.format(
+                qwen_image_desc=self.available_models['Qwen-Image']
+            )
 
     def _create_task_prompt(self) -> str:
         """Create the task-specific prompt based on current state."""
@@ -2577,7 +2592,7 @@ class ModelSelector:
             self.logger.info(f"Task Prompt Length: {len(task_prompt)} characters")  
             self.logger.info(f"Task Prompt:\n{task_prompt}")
 
-            response = track_llm_call(self.llm_json.invoke, "model_selection", [
+            response = track_llm_call(self.llm_json.invoke, "negative_model_selection", [
                 ("system", base_prompt),
                 ("human", task_prompt)
             ])
@@ -2608,10 +2623,10 @@ class ModelSelector:
                     except:
                         analysis = None
                 
-                # Get RAG guidance for negative prompt generation
+                # Get RAG guidance for negative prompt generation and model selection
                 current_step = "model_selection"
-                current_substep = "negative_prompt_generation"
-                workflow_context = get_workflow_context(current_step, current_substep)
+                current_substep = "negative_model_selection"
+                workflow_context = get_workflow_context(current_step, current_substep, config_obj=config)
                 
                 neg_result = self.negative_prompt_generator.generate_negative_prompt(
                     result.get("generating_prompt", ""), 
@@ -2682,16 +2697,16 @@ def intention_understanding_node(state: MessagesState) -> Command[str]:
         
         # Get RAG guidance for creativity level
         # Get workflow context for creativity level determination
-        creativity_workflow_context = get_workflow_context("intention", "creativity_level_determination")
+        creativity_workflow_context = get_workflow_context("intention", "creativity_level_determination", config_obj=config)
         
         # Use workflow context directly (contains all necessary guidance)
         if creativity_workflow_context:
             workflow_guidance = format_workflow_guidance_text(creativity_workflow_context, include_overview=True)
             
-            # Determine creativity level using only workflow context (will log complete system prompt)
+            # Determine creativity level using workflow context (will log complete system prompt)
             determined_creativity_level = analyzer.determine_creativity_level(
                 last_message.content, 
-                rag_guidance=workflow_guidance
+                workflow_context=creativity_workflow_context
             )
         config.prompt_understanding["creativity_level"] = determined_creativity_level
         logger.info(f"Determined creativity level: {determined_creativity_level.value}")
@@ -2701,7 +2716,7 @@ def intention_understanding_node(state: MessagesState) -> Command[str]:
             # Get comprehensive workflow context for intention analysis
             current_step = "intention"
             current_substep = "intention_analysis"
-            workflow_context = get_workflow_context(current_step, current_substep)
+            workflow_context = get_workflow_context(current_step, current_substep, config_obj=config)
             
             # Analyze prompt with workflow context
             analysis = analyzer.analyze_prompt(
@@ -3038,10 +3053,18 @@ Task Requirements:
     return final_prompt
 
 def get_active_guidance(config_obj, logger_obj=None) -> Dict[str, Any]:
-    """Get guidance from the currently active model (qwen_image or qwen_image_edit)."""
+    """Get guidance from the currently active model only if minimum threshold is met."""
+    global memory_manager
+    
     active_model_key = getattr(config_obj, "active_guidance_model", "qwen_image")
     if logger_obj:
         logger_obj.debug(f"Getting active guidance from model: {active_model_key}")
+    
+    # Check if memory manager exists and minimum threshold is met
+    if memory_manager and not memory_manager.is_guidance_available(active_model_key):
+        if logger_obj:
+            logger_obj.debug(f"Minimum threshold not met for {active_model_key}, returning empty guidance")
+        return {"positive_guidance": {}, "unsuccessful_patterns": {}}
     
     if isinstance(config_obj.workflow_guidance, dict):
         # Get guidance for the active model
@@ -3049,317 +3072,307 @@ def get_active_guidance(config_obj, logger_obj=None) -> Dict[str, Any]:
         if logger_obj:
             logger_obj.debug(f"Active guidance has {len(active_guidance.get('positive_guidance', {}))} step analyses")
         return active_guidance
+    
     if logger_obj:
         logger_obj.warning("workflow_guidance is not a dict, returning empty guidance")
-    return {}
+    return {"positive_guidance": {}, "unsuccessful_patterns": {}}
 
-def get_workflow_context(current_step: str, current_substep: str = "") -> Dict[str, Any]:
+def get_workflow_context(current_step: str, current_substep: str = "", include_substep_filter: bool = True, config_obj=None) -> Dict[str, Any]:
     """
-    Get comprehensive workflow context including all steps, current position, and warnings.
+    Get simplified workflow context for guidance.
+    
+    Args:
+        current_step: The current main workflow step
+        current_substep: The current sub-step within the main step
+        include_substep_filter: If True, filter guidance to relevant substeps
     
     Returns:
-        Dict containing workflow overview, current step info, and all warnings
+        Dict containing current step info and active guidance
     """
+    import logging
+    global config
+    logger = logging.getLogger(__name__)
     logger.debug(f"Getting workflow context for step: {current_step}, substep: {current_substep}")
     
-    workflow_steps = {
-        "intention": {
-            "name": "Intention Understanding",
-            "description": "Analyze user prompt, determine creativity level, and refine the prompt",
-            "substeps": [
-                "creativity_level_determination",
-                "intention_analysis", 
-                "prompt_refinement"
-            ],
-            "next_steps": ["model_selection"]
-        },
-        "model_selection": {
-            "name": "Model Selection & Generation",
-            "description": "Generate negative prompt, polish prompt, select best model, and generate image",
-            "substeps": [
-                "negative_prompt_generation",
-                "prompt_polishing", 
-                "model_selection",
-                "image_generation"
-            ],
-            "next_steps": ["evaluation"]
-        },
-        "evaluation": {
-            "name": "Evaluation & Quality Assessment", 
-            "description": "Evaluate generated image quality and decide on regeneration",
-            "substeps": [
-                "quality_evaluation",
-                "regeneration_decision"
-            ],
-            "next_steps": []
-        }
+    # Get all guidance from the active model's workflow guidance
+    # Access the global workflow guidance that was loaded at startup
+    try:
+        # Use passed config first, then try global config
+        config_to_use = config_obj
+        if not config_to_use:
+            global config
+            config_to_use = config
+            
+        logger.debug(f"Checking config: exists={config_to_use is not None}")
+        if config_to_use:
+            logger.debug(f"Config has workflow_guidance: {hasattr(config_to_use, 'workflow_guidance')}")
+            if hasattr(config_to_use, 'workflow_guidance'):
+                logger.debug(f"Workflow guidance type: {type(config_to_use.workflow_guidance)}")
+                if config_to_use.workflow_guidance:
+                    logger.debug(f"Workflow guidance keys: {list(config_to_use.workflow_guidance.keys()) if isinstance(config_to_use.workflow_guidance, dict) else 'Not a dict'}")
+        
+        # Try to get guidance from config first
+        if config_to_use and hasattr(config_to_use, 'workflow_guidance') and config_to_use.workflow_guidance:
+            active_model_key = getattr(config_to_use, "active_guidance_model", "qwen_image")
+            active_guidance = config_to_use.workflow_guidance.get(active_model_key, {})
+            logger.debug(f"Using config guidance for {active_model_key}: {len(active_guidance.get('positive_guidance', {}))} positive patterns")
+        else:
+            # Try to use memory manager from config or global
+            memory_mgr = None
+            if config_to_use and hasattr(config_to_use, 'memory_manager'):
+                memory_mgr = config_to_use.memory_manager
+            else:
+                # Try global memory manager if available
+                try:
+                    global memory_manager
+                    memory_mgr = memory_manager
+                except NameError:
+                    memory_mgr = None
+                    
+            logger.debug(f"Memory manager exists: {memory_mgr is not None}")
+            if memory_mgr:
+                logger.debug(f"Memory manager guidance available for qwen_image: {memory_mgr.is_guidance_available('qwen_image')}")
+                if memory_mgr.is_guidance_available("qwen_image"):
+                    logger.debug("Memory manager indicates guidance is available, retrieving...")
+                    # Use memory manager to get guidance for a sample prompt
+                    sample_guidance = memory_mgr.get_workflow_guidance("sample prompt", "qwen_image")
+                    active_guidance = sample_guidance if sample_guidance else {"positive_guidance": {}, "unsuccessful_patterns": {}}
+                    logger.debug(f"Retrieved guidance from memory manager: {len(active_guidance.get('positive_guidance', {}))} positive patterns")
+                else:
+                    logger.debug("Memory manager indicates guidance not available")
+                    active_guidance = {"positive_guidance": {}, "unsuccessful_patterns": {}}
+            else:
+                logger.debug("No memory manager available")
+                active_guidance = {"positive_guidance": {}, "unsuccessful_patterns": {}}
+    except Exception as e:
+        # Fallback to empty guidance if memory manager is not available
+        logger.debug(f"Guidance retrieval failed: {e}, using empty guidance")
+        import traceback
+        logger.debug(traceback.format_exc())
+        active_guidance = {"positive_guidance": {}, "unsuccessful_patterns": {}}
+    
+    # Handle legacy guidance key mapping - merge old separate keys into new unified key
+    if "negative_model_selection" not in active_guidance.get("positive_guidance", {}):
+        positive_guidance = active_guidance.get("positive_guidance", {})
+        unsuccessful_patterns = active_guidance.get("unsuccessful_patterns", {})
+        
+        # Check if we have guidance for the old separate keys
+        model_selection_guidance = positive_guidance.get("model_selection", [])
+        negative_prompt_guidance = positive_guidance.get("negative_prompt_generation", [])
+        
+        if model_selection_guidance or negative_prompt_guidance:
+            # Merge guidance from both old keys
+            merged_guidance = []
+            if model_selection_guidance:
+                merged_guidance.extend(model_selection_guidance)
+                logger.debug(f"Found {len(model_selection_guidance)} model_selection guidance patterns")
+            if negative_prompt_guidance:
+                merged_guidance.extend(negative_prompt_guidance)
+                logger.debug(f"Found {len(negative_prompt_guidance)} negative_prompt_generation guidance patterns")
+            
+            # Add the merged guidance under the new unified key
+            positive_guidance["negative_model_selection"] = merged_guidance
+            active_guidance["positive_guidance"] = positive_guidance
+            logger.debug(f"Merged {len(merged_guidance)} total patterns into negative_model_selection guidance")
+        
+        # Do the same for unsuccessful patterns
+        model_selection_unsuccessful = unsuccessful_patterns.get("model_selection", [])
+        negative_prompt_unsuccessful = unsuccessful_patterns.get("negative_prompt_generation", [])
+        
+        if model_selection_unsuccessful or negative_prompt_unsuccessful:
+            merged_unsuccessful = []
+            if model_selection_unsuccessful:
+                merged_unsuccessful.extend(model_selection_unsuccessful)
+            if negative_prompt_unsuccessful:
+                merged_unsuccessful.extend(negative_prompt_unsuccessful)
+            
+            unsuccessful_patterns["negative_model_selection"] = merged_unsuccessful
+            active_guidance["unsuccessful_patterns"] = unsuccessful_patterns
+            logger.debug(f"Merged {len(merged_unsuccessful)} unsuccessful patterns into negative_model_selection")
+    
+    positive_guidance = active_guidance.get("positive_guidance", {})
+    unsuccessful_patterns = active_guidance.get("unsuccessful_patterns", {})
+    logger.debug(f"Available positive guidance: {list(positive_guidance.keys())}")
+
+    # Build relevant substeps list for current and upcoming substeps
+    relevant_substeps = []
+    if include_substep_filter and current_substep:
+        # All workflow substeps in logical order
+        all_substeps = [
+            "creativity_level_determination",
+            "intention_analysis", 
+            "prompt_refinement",
+            "negative_model_selection",
+            "prompt_polishing",
+            "image_generation",
+            "quality_evaluation",
+            "regeneration_decision"
+        ]
+        
+        # Find current substep index and include current + upcoming
+        try:
+            current_index = all_substeps.index(current_substep)
+            relevant_substeps = all_substeps[current_index:]  # Current + all remaining substeps
+        except ValueError:
+            relevant_substeps = [current_substep]
+    else:
+        # Include all substeps
+        relevant_substeps = [
+            "creativity_level_determination",
+            "intention_analysis", 
+            "prompt_refinement",
+            "negative_model_selection",
+            "prompt_polishing",
+            "image_generation",
+            "quality_evaluation",
+            "regeneration_decision"
+        ]
+    
+    logger.debug(f"Relevant substeps for guidance: {relevant_substeps}")
+    
+    # Map substeps to proper step numbers and display names
+    substep_to_step = {
+        "creativity_level_determination": {"number": 1, "name": "Creativity Level Determination"},
+        "intention_analysis": {"number": 2, "name": "Intention Analysis"},
+        "prompt_refinement": {"number": 3, "name": "Prompt Refinement"},
+        "negative_model_selection": {"number": 4, "name": "Negative Prompt & Model Selection"},
+        "prompt_polishing": {"number": 5, "name": "Prompt Polishing"},
+        "image_generation": {"number": 6, "name": "Image Generation"},
+        "quality_evaluation": {"number": 7, "name": "Quality Evaluation"},
+        "regeneration_decision": {"number": 8, "name": "Regeneration Decision"}
     }
     
-    # Get all guidance from the active model's workflow guidance
-    active_guidance = get_active_guidance(config, logger)
-    positive_guidance = active_guidance.get("positive_guidance", {})
-    negative_warnings = active_guidance.get("negative_warnings", {})
-    logger.debug(f"Available positive guidance: {list(positive_guidance.keys())}")
+    # Get step info from substep, with fallback
+    if current_substep and current_substep in substep_to_step:
+        step_info = substep_to_step[current_substep]
+        step_number = step_info["number"]
+        step_name = step_info["name"]
+    else:
+        # Fallback based on current_step
+        step_number = 1
+        step_name = current_step.replace('_', ' ').title()
     
-    # Build comprehensive context
+    # Simple context structure
     context = {
-        "workflow_overview": {
-            "total_steps": len(workflow_steps),
-            "steps_summary": {k: {"name": v["name"], "description": v["description"]} 
-                            for k, v in workflow_steps.items()}
-        },
         "current_position": {
             "step": current_step,
-            "step_name": workflow_steps.get(current_step, {}).get("name", "Unknown"),
+            "step_name": step_name,
             "substep": current_substep,
-            "step_number": list(workflow_steps.keys()).index(current_step) + 1 if current_step in workflow_steps else 0
+            "step_number": step_number
         },
-        "current_step_guidance": {},
-        "upcoming_step_warnings": {},
-        "remaining_steps": [],
+        "filtered_substeps": relevant_substeps,
         "active_guidance": {
             "positive_guidance": positive_guidance,
-            "negative_warnings": negative_warnings
+            "unsuccessful_patterns": unsuccessful_patterns
         }
     }
     
-    logger.debug(f"Current position: Step {context['current_position']['step_number']} - {context['current_position']['step_name']}")
-    if current_substep:
-        logger.debug(f"Current substep: {current_substep}")
-    
-    # Get remaining steps and their warnings
-    current_step_index = list(workflow_steps.keys()).index(current_step) if current_step in workflow_steps else -1
-    
-    if current_step_index >= 0:
-        remaining_step_keys = list(workflow_steps.keys())[current_step_index:]
-        logger.debug(f"Remaining steps: {remaining_step_keys}")
-        
-    # Get guidance for current step
-    if current_substep in positive_guidance:
-        context["current_step_guidance"] = {"guidance": positive_guidance[current_substep]}
-        logger.debug(f"Found guidance for current substep: {current_substep}")
-    
-    # Get remaining steps and their warnings
-    current_step_index = list(workflow_steps.keys()).index(current_step) if current_step in workflow_steps else -1
-    
-    if current_step_index >= 0:
-        remaining_step_keys = list(workflow_steps.keys())[current_step_index:]
-        logger.debug(f"Remaining steps: {remaining_step_keys}")
-        
-        # Include current step and next steps in the remaining_steps list
-        for step_key in remaining_step_keys:
-            step_info = workflow_steps[step_key]
-            next_steps = step_info.get("next_steps", [])
-            
-            step_data = {
-                "key": step_key,
-                "name": step_info["name"], 
-                "description": step_info["description"],
-                "substeps": step_info["substeps"],
-                "next_steps": next_steps
-            }
-            context["remaining_steps"].append(step_data)
-            
-            # Collect guidance for all steps (including current step)
-            for substep in step_info["substeps"]:
-                if substep in negative_warnings:
-                    warning = negative_warnings[substep]
-                    positive_guid = positive_guidance.get(substep, "")
-                    
-                    # Include both warnings and positive guidance
-                    if warning or positive_guid:
-                        context["upcoming_step_warnings"][substep] = {
-                            "warnings": warning,
-                            "guidance": positive_guid
-                        }
-                        logger.debug(f"Found guidance for substep: {substep}")
-    
-    logger.debug(f"Total upcoming warnings found: {len(context['upcoming_step_warnings'])}")
     return context
+
+def get_substep_explanation(substep: str) -> str:
+    """Provide brief explanations for each workflow substep."""
+    explanations = {
+        "creativity_level_determination": "Analyzes prompt specificity to determine how creative the system should be (LOW/MEDIUM/HIGH)",
+        "intention_analysis": "Extracts key elements, style preferences, and user intent from the prompt",
+        "prompt_refinement": "Clarifies and enhances the prompt while preserving core intent and adding necessary details",
+        "negative_model_selection": "Selects optimal model (Qwen-Image for new generation, Qwen-Image-Edit for modifications) and creates negative prompts to avoid unwanted elements",
+        "prompt_polishing": "Final optimization of the prompt for optimal model performance",
+        "image_generation": "Generates the actual image using the selected model and refined prompts",
+        "quality_evaluation": "Assesses technical quality, prompt adherence, and artistic merit of generated content",
+        "regeneration_decision": "Determines whether to regenerate based on quality thresholds and improvement potential"
+    }
+    return explanations.get(substep, "Specialized workflow substep")
 
 def format_workflow_guidance_text(workflow_context: Dict[str, Any], include_overview: bool = True) -> str:
     """Format workflow context into guidance text for LLM prompts.
     
-    Shows workflow overview (if requested), current position, and guidance for all following steps.
+    Always shows workflow substep explanations. When minimum DB threshold is met,
+    adds specific guidance patterns on top.
     """
+    import logging
+    logger = logging.getLogger(__name__)
     logger.debug(f"Formatting workflow guidance text, include_overview: {include_overview}")
     
-    # Get active guidance to access positive_guidance and negative_warnings
+    # Get active guidance to access positive_guidance and unsuccessful_patterns
     active_guidance = workflow_context.get("active_guidance", {})
     positive_guidance = active_guidance.get("positive_guidance", {})
-    negative_warnings = active_guidance.get("negative_warnings", {})
+    unsuccessful_patterns = active_guidance.get("unsuccessful_patterns", {})
+    filtered_substeps = workflow_context.get("filtered_substeps", [])
     
     guidance_parts = []
     
-    if include_overview:
-        # Workflow overview
-        guidance_parts.append("=== WORKFLOW OVERVIEW ===")
-        overview = workflow_context["workflow_overview"]
-        guidance_parts.append(f"{overview['total_steps']}-step workflow:")
-        
-        for i, (step_key, step_info) in enumerate(overview["steps_summary"].items(), 1):
-            guidance_parts.append(f"{i}. {step_info['name']}")
+    # === ALWAYS PRESENT: WORKFLOW SUBSTEP EXPLANATIONS ===
+    guidance_parts.append("=== WORKFLOW SUBSTEP EXPLANATIONS ===")
+    guidance_parts.append("These substeps guide the image generation process:")
+    guidance_parts.append("")
+    
+    # All substeps with explanations
+    all_substeps = [
+        "creativity_level_determination",
+        "intention_analysis", 
+        "prompt_refinement",
+        "negative_model_selection",
+        "prompt_polishing",
+        "image_generation",
+        "quality_evaluation",
+        "regeneration_decision"
+    ]
+    
+    for substep in all_substeps:
+        substep_display = substep.replace('_', ' ').title()
+        explanation = get_substep_explanation(substep)
+        guidance_parts.append(f"• {substep_display}: {explanation}")
+    
+    guidance_parts.append("")
     
     # Current position
     current = workflow_context["current_position"]
-    guidance_parts.append(f"\n=== CURRENT: Step {current['step_number']} - {current['step_name']} ===")
+    guidance_parts.append(f"=== CURRENT STEP: {current['step_number']} - {current['step_name']} ===")
     if current["substep"]:
-        guidance_parts.append(f"Substep: {current['substep'].replace('_', ' ').title()}")
+        substep_display = current["substep"].replace('_', ' ').title()
+        guidance_parts.append(f"Current Focus: {substep_display}")
+        guidance_parts.append(f"Purpose: {get_substep_explanation(current['substep'])}")
     
-    # Only show information about the immediate next step
-    if workflow_context["remaining_steps"]:
-        # Get the current step
-        current_step_key = current["step"]
-        current_step_info = None
-        next_step_info = None
-        
-        # Find the current step in the workflow_steps
-        for i, step in enumerate(workflow_context["remaining_steps"]):
-            if step["key"] == current_step_key:
-                current_step_info = step
-                # Check if there's a next step
-                if i + 1 < len(workflow_context["remaining_steps"]):
-                    next_step_info = workflow_context["remaining_steps"][i + 1]
-                break
-            elif i == 0 and current_step_key != step["key"]:
-                # If we're on the first remaining step and it's not the current step,
-                # then this is the next step
-                next_step_info = step
-                break
-        
-        # Display the next step if found
-        if next_step_info:
-            step_num = current["step_number"] + 1
-            guidance_parts.append(f"\n=== NEXT: Step {step_num} - {next_step_info['name']} ===")
-            guidance_parts.append(f"Substeps: {', '.join([s.replace('_', ' ').title() for s in next_step_info['substeps']])}")
+    # === CONDITIONAL: SPECIFIC GUIDANCE (when minimum threshold met) ===
+    # Check if we have any actual guidance patterns available
+    has_guidance = bool(positive_guidance or unsuccessful_patterns)
     
-    # Current step guidance
-    if workflow_context.get("current_step_guidance"):
-        guidance_parts.append(f"\n=== GUIDANCE ===")
-        guidance = workflow_context["current_step_guidance"]
-        
-        if guidance.get("success_patterns"):
-            guidance_parts.append(f"✓ Success: {guidance['success_patterns']}")
-        
-        if guidance.get("preventive_guidance"):
-            guidance_parts.append(f"⚠ Prevent: {guidance['preventive_guidance']}")
-        
-        if guidance.get("impact_on_next"):
-            guidance_parts.append(f"→ Impact: {guidance['impact_on_next']}")
+    logger.debug(f"Checking guidance availability: positive={len(positive_guidance)}, unsuccessful={len(unsuccessful_patterns)}, has_guidance={has_guidance}")
     
-    # Show guidance for next substeps (both within current step and next step)
-    if workflow_context.get("upcoming_step_warnings"):
-        # Get current step info to find remaining substeps
-        current_step_key = current["step"]
-        current_substep = current["substep"]
+    if has_guidance:
+        guidance_parts.append(f"\n=== LEARNED GUIDANCE PATTERNS ===")
+        guidance_parts.append("Based on previous successful and unsuccessful generations:")
+        guidance_parts.append("")
         
-        # Find current step info and remaining substeps
-        current_step_substeps = []
-        next_step_substeps = []
+        # Show guidance for relevant substeps only
+        guidance_shown = False
+        logger.debug(f"Showing guidance for filtered substeps: {filtered_substeps}")
+        logger.debug(f"Available positive guidance keys: {list(positive_guidance.keys())}")
+        logger.debug(f"Available unsuccessful patterns keys: {list(unsuccessful_patterns.keys())}")
         
-        for step in workflow_context["remaining_steps"]:
-            if step["key"] == current_step_key:
-                current_step_substeps = step["substeps"]
-                break
-        
-        # Find the next step's substeps
-        if next_step_info:
-            next_step_substeps = next_step_info["substeps"]
-        
-        # Get remaining substeps in current step (after current substep)
-        remaining_current_substeps = []
-        if current_substep and current_step_substeps:
-            try:
-                current_index = current_step_substeps.index(current_substep)
-                remaining_current_substeps = current_step_substeps[current_index + 1:]
-            except (ValueError, IndexError):
-                remaining_current_substeps = []
-        
-        # Combine current substep + remaining current substeps + next step substeps
-        all_relevant_substeps = []
-        if current_substep:
-            all_relevant_substeps.append(current_substep)
-        all_relevant_substeps.extend(remaining_current_substeps + next_step_substeps)
-        
-        # Filter warnings to include current substep, remaining current step substeps and next step substeps
-        relevant_warnings = {}
-        for substep, warning_data in workflow_context["upcoming_step_warnings"].items():
-            if substep in all_relevant_substeps:
-                relevant_warnings[substep] = warning_data
-        
-        # Add comprehensive guidance for all following steps/substeps
-        if True:  # Always show guidance section
-            guidance_parts.append(f"\n=== GUIDANCE FOR FOLLOWING STEPS ===")
-            guidance_parts.append("I am providing you guidance and warnings for all upcoming steps to help you make better decisions:")
-            
-            # Get all remaining steps starting from current
-            remaining_steps = workflow_context.get("remaining_steps", [])
-            current_step_found = False
-            
-            for step_info in remaining_steps:
-                step_key = step_info["key"]
-                step_name = step_info["name"]
-                substeps = step_info["substeps"]
+        for substep in filtered_substeps:
+            if substep in positive_guidance or substep in unsuccessful_patterns:
+                substep_display = substep.replace('_', ' ').title()
+                guidance_parts.append(f"• {substep_display}:")
                 
-                if step_key == current["step"]:
-                    current_step_found = True
+                if substep in positive_guidance:
+                    guidance_parts.append(f"  ✓ Success Patterns: {positive_guidance[substep]}")
                 
-                if current_step_found:
-                    # Always show the step header
-                    guidance_parts.append(f"\n📋 {step_name.upper()}:")
-                    step_has_content = False
-                    
-                    for substep in substeps:
-                        substep_name = substep.replace('_', ' ').title()
-                        
-                        # Add positive guidance if available
-                        positive_text = positive_guidance.get(substep, "")
-                        # Add warnings if available  
-                        warning_info = relevant_warnings.get(substep, {})
-                        warning_text = warning_info.get("warnings", "") if isinstance(warning_info, dict) else ""
-                        
-                        # Debug: Check if we have warnings in negative_warnings but not in relevant_warnings
-                        direct_warning = negative_warnings.get(substep, "")
-                        if direct_warning and not warning_text:
-                            logger.debug(f"Warning mismatch for {substep}: direct='{direct_warning[:50]}...', filtered='{warning_text}'")
-                        
-                        # Always show substep, even if no guidance available
-                        guidance_parts.append(f"  • {substep_name}:")
-                        step_has_content = True
-                        
-                        # Always show guidance section
-                        if positive_text:
-                            guidance_parts.append(f"    ✓ GUIDANCE: {positive_text}")
-                        else:
-                            guidance_parts.append(f"    ✓ GUIDANCE: (No specific guidance available)")
-                        
-                        # Always show warning section - use direct warning if available
-                        display_warning = warning_text or direct_warning
-                        if display_warning:
-                            guidance_parts.append(f"    ⚠️ WARNING: {display_warning}")
-                        else:
-                            guidance_parts.append(f"    ⚠️ WARNING: (No specific warnings available)")
-                    
-                    if not step_has_content:
-                        guidance_parts.append("  (No substeps available)")
-            
-            if not current_step_found:
-                guidance_parts.append("  (Current step not found in remaining steps)")
+                if substep in unsuccessful_patterns:
+                    guidance_parts.append(f"  ❌ Patterns to Avoid: {unsuccessful_patterns[substep]}")
+                
+                guidance_parts.append("")
+                guidance_shown = True
+        
+        if not guidance_shown:
+            guidance_parts.append("  No specific patterns available for current substeps.")
+            guidance_parts.append("")
+    else:
+        guidance_parts.append(f"\n=== GUIDANCE STATUS ===")
+        guidance_parts.append("Building guidance database - specific patterns will appear as more images are generated.")
+        guidance_parts.append("")
     
-    # Only include relevant workflow insights
-    if workflow_context.get("workflow_insights"):
-        insights = workflow_context["workflow_insights"]
-        relevant_insights = []
-        
-        if insights.get("success_combinations"):
-            relevant_insights.append(f"💡 {insights['success_combinations']}")
-        
-        if relevant_insights:
-            guidance_parts.append(f"\n=== KEY INSIGHTS ===")
-            guidance_parts.extend(relevant_insights)
-    formatted_text = "\n".join(guidance_parts)
-    logger.debug(f"Generated workflow guidance text with {len(formatted_text)} characters")
-    return formatted_text
+    return "\n".join(guidance_parts)
 
 def execute_model(model_name: str, prompt: str, negative_prompt: str, reference_content_image: str = None) -> str:
     """Execute the selected model and return paths to generated images."""
@@ -3471,7 +3484,7 @@ def evaluation_node(state: MessagesState) -> Command[str]:
         evaluation_prompt = [
             (
                 "system",
-                make_gen_image_judge_prompt(config) + guidance_text
+                guidance_text + "\n\n" + make_gen_image_judge_prompt(config)
             ),
             (
                 "human",
@@ -3797,9 +3810,8 @@ def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, o
         llm_latencies = {
             "intention_analysis": [], 
             "refine_prompt": [], 
-            "model_selection": [], 
+            "negative_model_selection": [], 
             "evaluation": [],
-            "negative_prompt_generation": [],
             "polish_prompt": [],
             "creativity_determination": [],
             "model_performance_analysis": [],
@@ -3808,9 +3820,8 @@ def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, o
         llm_token_counts = {
             "intention_analysis": [], 
             "refine_prompt": [], 
-            "model_selection": [], 
+            "negative_model_selection": [], 
             "evaluation": [],
-            "negative_prompt_generation": [],
             "polish_prompt": [],
             "creativity_determination": [],
             "model_performance_analysis": [],
@@ -3905,10 +3916,10 @@ def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, o
                         logger.info(f"\n📋 {step_name.upper()}:")
                         logger.info(f"   GUIDANCE: {guidance_text}")
                         
-                    # Show negative warnings if available
-                    if qwen_image_guidance.get('negative_warnings'):
-                        logger.info(f"\n⚠️  NEGATIVE WARNINGS:")
-                        for step_name, warning_text in qwen_image_guidance['negative_warnings'].items():
+                    # Show unsuccessful patterns if available
+                    if qwen_image_guidance.get('unsuccessful_patterns'):
+                        logger.info(f"\n❌ UNSUCCESSFUL PATTERNS:")
+                        for step_name, warning_text in qwen_image_guidance['unsuccessful_patterns'].items():
                             if warning_text.strip():
                                 logger.info(f"   {step_name}: {warning_text}")
                 else:
@@ -3921,10 +3932,10 @@ def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, o
                         logger.info(f"\n📋 {step_name.upper()}:")
                         logger.info(f"   GUIDANCE: {guidance_text}")
                         
-                    # Show negative warnings if available
-                    if qwen_edit_guidance.get('negative_warnings'):
-                        logger.info(f"\n⚠️  NEGATIVE WARNINGS:")
-                        for step_name, warning_text in qwen_edit_guidance['negative_warnings'].items():
+                    # Show unsuccessful patterns if available
+                    if qwen_edit_guidance.get('unsuccessful_patterns'):
+                        logger.info(f"\n❌ UNSUCCESSFUL PATTERNS:")
+                        for step_name, warning_text in qwen_edit_guidance['unsuccessful_patterns'].items():
                             if warning_text.strip():
                                 logger.info(f"   {step_name}: {warning_text}")
                 else:
